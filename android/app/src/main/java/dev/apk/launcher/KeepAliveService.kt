@@ -255,13 +255,16 @@ class KeepAliveService : Service() {
                 if (close) 0xCC33111F.toInt() else 0xDD1A2233.toInt(),
                 dp(11),
             )
-            setOnClickListener { action() }
             setOnTouchListener { v, e ->
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> v.alpha = 0.55f
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.alpha = 1f
+                    MotionEvent.ACTION_DOWN -> v.alpha = 0.45f
+                    MotionEvent.ACTION_UP -> {
+                        v.alpha = 1f
+                        action()
+                    }
+                    MotionEvent.ACTION_CANCEL -> v.alpha = 1f
                 }
-                false
+                true
             }
         }
     }
@@ -333,13 +336,19 @@ class KeepAliveService : Service() {
         runCatching {
             val launch = packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                // Если окно уже открыто — та же задача выводится вперёд с новыми
-                // размерами (без пересоздания и сброса состояния); если нет —
-                // запускается заново в мини-окне.
+                // RESET_TASK_IF_NEEDED заставляет систему пере-приложить границы
+                // к существующей freeform-задаче (иначе повторный старт просто
+                // возвращает окно наверх, не меняя размер).
+                launch.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                )
                 startActivity(launch, freeformOptions(r))
             }
         }
+        val dm = resources.displayMetrics
+        val pct = ((r.width() * 100f) / dm.widthPixels).toInt()
+        val name = pkg.substringAfterLast('.').ifBlank { pkg }
+        toast("$name: $pct% окна")
     }
 
     private fun toast(msg: String) {
