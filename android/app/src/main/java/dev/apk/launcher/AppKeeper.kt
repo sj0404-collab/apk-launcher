@@ -7,27 +7,32 @@ import android.os.Build
 
 class AppKeeper(private val context: Context) {
 
-    private val prefs: SharedPreferences =
+    val prefs: SharedPreferences =
         context.getSharedPreferences("keeps", Context.MODE_PRIVATE)
 
     fun set(pkg: String, keep: Boolean): Boolean {
-        if (keep) {
-            prefs.edit().putBoolean(sanitize(pkg), true).apply()
-        } else {
-            prefs.edit().remove(sanitize(pkg)).apply()
-        }
+        val clean = pkg.trim()
+        if (clean.isEmpty()) return false
+        val e = prefs.edit()
+        if (keep) e.putBoolean(clean, true) else e.remove(clean)
+        e.apply()
         syncService()
         return true
     }
 
     fun list(): List<String> =
-        prefs.all.filterValues { it == true }.map { it.key }
+        prefs.all.filterValues { it == true }.keys.sorted()
 
-    fun isKept(pkg: String): Boolean = prefs.getBoolean(sanitize(pkg), false)
+    fun isKept(pkg: String): Boolean = prefs.getBoolean(pkg.trim(), false)
 
     fun syncService() {
+        val list = list()
         val intent = Intent(context, KeepAliveService::class.java).apply {
-            putStringArrayListExtra(MainActivity.KEEP_EXTRA, ArrayList(list()))
+            putStringArrayListExtra(MainActivity.KEEP_EXTRA, ArrayList(list))
+        }
+        if (list.isEmpty()) {
+            context.stopService(intent)
+            return
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
@@ -40,6 +45,4 @@ class AppKeeper(private val context: Context) {
         context.stopService(Intent(context, KeepAliveService::class.java))
         prefs.edit().clear().apply()
     }
-
-    private fun sanitize(pkg: String): String = pkg.trim()
 }

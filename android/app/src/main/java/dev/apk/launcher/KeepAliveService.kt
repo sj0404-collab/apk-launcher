@@ -42,6 +42,10 @@ class KeepAliveService : Service() {
         if (list != null) {
             kept.clear()
             kept.addAll(list)
+        } else if (kept.isEmpty()) {
+            // Система перезапустила процесс (START_STICKY / null intent) —
+            // восстанавливаем список «держимых» из хранилища.
+            kept.addAll(AppKeeper(this).list())
         }
         startForeground(NOTIF_ID, buildNotification())
         handler.removeCallbacks(watchdog)
@@ -66,7 +70,9 @@ class KeepAliveService : Service() {
         runCatching {
             val launch = packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                launch.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                )
                 startActivity(launch)
             }
         }

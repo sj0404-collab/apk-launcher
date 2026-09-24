@@ -1,9 +1,12 @@
 package dev.apk.launcher
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var scrollContent: LinearLayout
     private lateinit var cardsBox: LinearLayout
     private lateinit var processPanel: LinearLayout
+    private lateinit var updateBar: LinearLayout
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -68,13 +72,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        maybeRequestNotifPermission()
         loadApps()
         keptPkgs = keeper.list().toSet()
+        keeper.syncService()
         loadProcesses()
         lastSig = ""
         render()
         handler.removeCallbacks(refresh)
         handler.post(refresh)
+        checkForUpdate()
     }
 
     override fun onPause() {
@@ -87,14 +94,72 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun maybeRequestNotifPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
+        }
+    }
+
+    private fun checkForUpdate() {
+        Updater.check(this, BuildConfig.VERSION_NAME) { latest, url ->
+            updateUrl = url
+            updateLatest = latest
+            updateBar.removeAllViews()
+            val title = tv("Обновление $latest доступно", 14f, Color.parseColor("#4ade80"), Typeface.BOLD)
+            updateBar.addView(title)
+            val btns = hBox()
+            btns.gravity = Gravity.CENTER_VERTICAL
+            btns.addView(miniBtn("открыть релиз") { openUrl(updateUrl) }, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            btns.addView(miniBtn("позже") { updateBar.visibility = View.GONE }, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val blp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            blp.topMargin = dp(8)
+            btns.layoutParams = blp
+            updateBar.addView(btns)
+            updateBar.visibility = View.VISIBLE
+        }
+    }
+
+    private fun openUrl(url: String) {
+        runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        }.onFailure { toast("Не удалось открыть ссылку") }
+    }
+
+    private var updateUrl = ""
+    private var updateLatest = ""
+
     private fun buildUi() {
         val root = vBox()
         root.setBackgroundColor(Color.parseColor("#0d0d12"))
         setContentView(root)
 
-        val header = hBox()
+        val header = vBox()
         header.setPadding(dp(16), dp(12), dp(16), dp(4))
-        header.addView(tv("APK Launcher", 20f, Color.WHITE, Typeface.BOLD))
+        val titleRow = hBox()
+        titleRow.orientation = LinearLayout.HORIZONTAL
+        titleRow.gravity = Gravity.CENTER_VERTICAL
+        titleRow.addView(tv("APK Launcher", 20f, Color.WHITE, Typeface.BOLD))
+        val versionTv = tv(BuildConfig.VERSION_NAME, 12f, Color.parseColor("#22c55e"), Typeface.BOLD)
+        versionTv.setBackgroundResource(R.drawable.pill_keep_on)
+        versionTv.setPadding(dp(8), dp(1), dp(8), dp(1))
+        val vlp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        vlp.setMargins(dp(10), 0, 0, 0)
+        versionTv.layoutParams = vlp
+        titleRow.addView(versionTv)
+        header.addView(titleRow)
+
+        updateBar = vBox()
+        updateBar.visibility = View.GONE
+        updateBar.setBackgroundResource(R.drawable.bg_update)
+        updateBar.setPadding(dp(12), dp(10), dp(12), dp(10))
+        val ublp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        ublp.setMargins(dp(16), dp(10), dp(16), 0)
+        updateBar.layoutParams = ublp
+        header.addView(updateBar)
 
         val search = EditText(this)
         search.hint = "Поиск приложений…"
@@ -104,8 +169,8 @@ class MainActivity : ComponentActivity() {
         search.isSingleLine = true
         search.setBackgroundResource(R.drawable.bg_search)
         search.setPadding(dp(12), 0, dp(12), 0)
-        val slp = LinearLayout.LayoutParams(0, dp(40), 1f)
-        slp.setMargins(dp(16), 0, 0, 0)
+        val slp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40))
+        slp.setMargins(0, dp(10), 0, 0)
         search.layoutParams = slp
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -127,6 +192,7 @@ class MainActivity : ComponentActivity() {
             showKeptOnly = !showKeptOnly
             lastSig = ""
             renderCards()
+            updateStats()
         }
         statAppsNum = statsNum(statApps)
         statAppsLabel = statsLabel(statApps, "приложений")
@@ -134,7 +200,7 @@ class MainActivity : ComponentActivity() {
 
         val statAlive = statColumn()
         statAliveNum = statsNum(statAlive)
-        statsLabel(statAlive, "живых процессов")
+        statsLabel(statAlive, "держится")
         keepbar.addView(statAlive)
 
         val statRefresh = statColumn()
@@ -270,9 +336,7 @@ class MainActivity : ComponentActivity() {
     private fun updateStats() {
         statAppsNum.text = if (showKeptOnly) keptPkgs.size.toString() else allApps.size.toString()
         statAppsLabel.text = if (showKeptOnly) "на keep" else "приложений"
-        statAliveNum.text = processes.count { p ->
-            keptPkgs.any { k -> p.packageName == k || p.packageName.startsWith("$k:") }
-        }.toString()
+        statAliveNum.text = keptPkgs.count { running(it) }.toString()
     }
 
     private fun updateProcessPane() {
@@ -355,6 +419,7 @@ class MainActivity : ComponentActivity() {
         keptPkgs = if (keep) keptPkgs + pkg else keptPkgs - pkg
         lastSig = ""
         renderCards()
+        updateStats()
         updateProcessPane()
     }
 
@@ -389,6 +454,7 @@ class MainActivity : ComponentActivity() {
         allApps = apps
     }
 
+    @Suppress("DEPRECATION")
     private fun loadProcesses() {
         val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
         val running = am.runningAppProcesses ?: emptyList()
@@ -400,6 +466,7 @@ class MainActivity : ComponentActivity() {
         processes = list
     }
 
+    @Suppress("DEPRECATION")
     private fun importanceName(importance: Int): String = when {
         importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND -> "background"
         importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE -> "сервис"
