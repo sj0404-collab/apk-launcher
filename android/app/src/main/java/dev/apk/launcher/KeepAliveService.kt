@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Rect
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -16,6 +17,7 @@ class KeepAliveService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val kept = HashSet<String>()
+    private val pinned = HashSet<String>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var running = true
 
@@ -39,13 +41,18 @@ class KeepAliveService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val list = intent?.getStringArrayListExtra(MainActivity.KEEP_EXTRA)
+        val pins = intent?.getStringArrayListExtra(MainActivity.PIN_EXTRA)
         if (list != null) {
             kept.clear()
             kept.addAll(list)
+            pinned.clear()
+            pinned.addAll(pins ?: emptyList())
         } else if (kept.isEmpty()) {
             // Система перезапустила процесс (START_STICKY / null intent) —
-            // восстанавливаем список «держимых» из хранилища.
-            kept.addAll(AppKeeper(this).list())
+            // восстанавливаем списки «держимых» и «мини-окон» из хранилища.
+            val keeper = AppKeeper(this)
+            kept.addAll(keeper.list())
+            pinned.addAll(keeper.pinnedList())
         }
         startForeground(NOTIF_ID, buildNotification())
         handler.removeCallbacks(watchdog)
@@ -75,9 +82,25 @@ class KeepAliveService : Service() {
                         Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or
                         Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 )
-                startActivity(launch)
+                // «Пинованные» приложения поднимаем сразу в уменьшенном окне,
+                // чтобы не теряли фокус и не убивались фоном.
+                val opts = if (pkg in pinned) {
+                    android.app.ActivityOptions.makeBasic().setLaunchBounds(miniBounds())
+                } else {
+                    android.app.ActivityOptions.makeBasic()
+                }
+                startActivity(launch, opts.toBundle())
             }
         }
+    }
+
+    private fun miniBounds(): Rect {
+        val dm = resources.displayMetrics
+        val w = (dm.widthPixels * 0.62f).toInt()
+        val h = (dm.heightPixels * 0.6f).toInt()
+        val x = dm.widthPixels - w
+        val y = dm.heightPixels - h
+        return Rect(x, y, x + w, y + h)
     }
 
     private fun createChannel() {

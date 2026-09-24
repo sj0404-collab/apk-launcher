@@ -2,17 +2,22 @@ package dev.apk.launcher
 
 import android.Manifest
 import android.app.ActivityOptions
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
+import android.util.Rational
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -46,6 +51,7 @@ class MainActivity : ComponentActivity() {
     private var allApps: List<AppEntry> = emptyList()
     private var processes: List<ProcEntry> = emptyList()
     private var keptPkgs: Set<String> = emptySet()
+    private var pinnedPkgs: Set<String> = emptySet()
     private var query = ""
     private var showKeptOnly = false
     private var lastSig = ""
@@ -77,6 +83,7 @@ class MainActivity : ComponentActivity() {
         maybeRequestNotifPermission()
         loadApps()
         keptPkgs = keeper.list().toSet()
+        pinnedPkgs = keeper.pinnedList().toSet()
         keeper.syncService()
         loadProcesses()
         lastSig = ""
@@ -87,14 +94,39 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        handler.removeCallbacks(refresh)
+        // В PiP лаунчер остаётся видимым и «живым»: не останавливаем refresh.
+        if (!isInPictureInPictureMode) handler.removeCallbacks(refresh)
         super.onPause()
+    }
+
+    override fun onStop() {
+        handler.removeCallbacks(refresh)
+        super.onStop()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(refresh)
         super.onDestroy()
     }
+
+    @Suppress("DEPRECATION")
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode)
+        if (isInPictureInPictureMode) {
+            pipHiddenBar = updateBar.visibility
+            pipHiddenPanel = processPanel.visibility
+            updateBar.visibility = View.GONE
+            processPanel.visibility = View.GONE
+        } else {
+            updateBar.visibility = pipHiddenBar
+            updateProcessPane()
+            handler.removeCallbacks(refresh)
+            handler.post(refresh)
+        }
+    }
+
+    private var pipHiddenBar = View.GONE
+    private var pipHiddenPanel = View.GONE
 
     private fun maybeRequestNotifPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -152,6 +184,20 @@ class MainActivity : ComponentActivity() {
         vlp.setMargins(dp(10), 0, 0, 0)
         versionTv.layoutParams = vlp
         titleRow.addView(versionTv)
+        titleRow.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+        val pipBtn = Button(this)
+        pipBtn.text = "PiP"
+        pipBtn.textSize = 12f
+        pipBtn.isAllCaps = false
+        pipBtn.minimumWidth = 0
+        pipBtn.minimumHeight = 0
+        pipBtn.setTextColor(Color.parseColor("#22c55e"))
+        pipBtn.setBackgroundResource(R.drawable.pill_keep_on)
+        val pipLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        pipLp.setMargins(dp(6), 0, 0, 0)
+        pipBtn.layoutParams = pipLp
+        pipBtn.setOnClickListener { enterPip() }
+        titleRow.addView(pipBtn)
         header.addView(titleRow)
 
         updateBar = vBox()
@@ -213,6 +259,7 @@ class MainActivity : ComponentActivity() {
         statRefresh.setOnClickListener {
             loadApps()
             keptPkgs = keeper.list().toSet()
+            pinnedPkgs = keeper.pinnedList().toSet()
             loadProcesses()
             lastSig = ""
             render()
@@ -284,6 +331,7 @@ class MainActivity : ComponentActivity() {
 
     private fun buildCard(app: AppEntry): View {
         val kept = app.packageName in keptPkgs
+        val pinned = app.packageName in pinnedPkgs
         val alive = running(app.packageName)
 
         val card = vBox()
@@ -329,7 +377,7 @@ class MainActivity : ComponentActivity() {
         )
 
         val keepBtn = Button(this)
-        keepBtn.text = if (kept) "держать" else "не держать"
+        keepBtn.text = if (kept) "снять keep" else "keep"
         keepBtn.textSize = 12f
         keepBtn.isAllCaps = false
         keepBtn.minimumWidth = 0
@@ -338,7 +386,22 @@ class MainActivity : ComponentActivity() {
         keepBtn.setBackgroundResource(if (kept) R.drawable.pill_keep_on else R.drawable.pill_keep_off)
         keepBtn.setOnClickListener { toggleKeep(app.packageName) }
         row.addView(keepBtn)
-        row.addView(miniBtn("в окно") { launchAdjacent(app.packageName) })
+
+        val btnRow = hBox()
+        btnRow.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(4)
+        }
+
+        val pinBtn = miniBtn("пин") { togglePin(app.packageName) }
+        pinBtn.setTextColor(if (pinned) Color.parseColor("#4ade80") else Color.parseColor("#b9b9cc"))
+        pinBtn.setBackgroundResource(if (pinned) R.drawable.pill_keep_on else R.drawable.pill_keep_off)
+        btnRow.addView(pinBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        btnRow.addView(miniBtn("окно") { launchAdjacent(app.packageName) },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(miniBtn("мини") { launchMini(app.packageName) },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        card.addView(btnRow)
         return card
     }
 
@@ -364,7 +427,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildProcRow(p: ProcEntry): View {
-        val kept = keptPkgs.any { k -> p.packageName == k || p.packageName.startsWith("$k:") }
+        val base = p.packageName.substringBefore(':')
+        val kept = base in keptPkgs
+        val pinned = base in pinnedPkgs
         val row = hBox()
         row.setBackgroundResource(R.drawable.bg_proc_row)
         row.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -399,9 +464,14 @@ class MainActivity : ComponentActivity() {
         state.setPadding(dp(8), dp(2), dp(8), dp(2))
         row.addView(state)
 
-        row.addView(miniBtn("в окно") { launchAdjacent(p.packageName) })
-        row.addView(miniBtn("запустить") { launch(p.packageName) })
-        row.addView(miniBtn(if (kept) "снять keep" else "keep") { toggleKeep(p.packageName) })
+        val pinBtn = miniBtn("пин") { togglePin(base) }
+        pinBtn.setTextColor(if (pinned) Color.parseColor("#4ade80") else Color.parseColor("#b9b9cc"))
+        pinBtn.setBackgroundResource(if (pinned) R.drawable.pill_keep_on else R.drawable.pill_keep_off)
+        row.addView(pinBtn)
+        row.addView(miniBtn("окно") { launchAdjacent(base) })
+        row.addView(miniBtn("мини") { launchMini(base) })
+        row.addView(miniBtn("запустить") { launch(base) })
+        row.addView(miniBtn(if (kept) "снять keep" else "keep") { toggleKeep(base) })
         return row
     }
 
@@ -456,6 +526,66 @@ class MainActivity : ComponentActivity() {
             true
         }.getOrDefault(false)
         if (!ok) toast("Не удалось открыть $pkg рядом")
+    }
+
+    private fun launchMini(pkg: String) {
+        val ok = runCatching {
+            val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val opts = ActivityOptions.makeBasic().setLaunchBounds(miniBounds())
+            startActivity(i, opts.toBundle())
+            true
+        }.getOrDefault(false)
+        if (!ok) toast("Не удалось открыть $pkg в мини-окне")
+    }
+
+    private fun miniBounds(): Rect {
+        val dm = resources.displayMetrics
+        val w = (dm.widthPixels * 0.62f).toInt()
+        val h = (dm.heightPixels * 0.6f).toInt()
+        val x = dm.widthPixels - w - dp(14)
+        val y = dm.heightPixels - h - dp(14)
+        return Rect(x, y, x + w, y + h)
+    }
+
+    private fun togglePin(pkg: String) {
+        val clean = pkg.substringBefore(':')
+        val pin = clean !in pinnedPkgs
+        if (!keeper.setPin(clean, pin)) {
+            toast("Не удалось изменить мини-окно")
+            return
+        }
+        pinnedPkgs = if (pin) pinnedPkgs + clean else pinnedPkgs - clean
+        keeper.syncService()
+        lastSig = ""
+        renderCards()
+    }
+
+    private fun enterPip() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching {
+                val params = PictureInPictureParams.Builder().apply {
+                    setAspectRatio(Rational(1, 1))
+                    setActions(listOf(buildPipAction()))
+                }.build()
+                enterPictureInPictureMode(params)
+            }.onFailure {
+                toast("Не удалось свернуть в PiP")
+            }
+        } else {
+            toast("PiP доступен на Android 8.0+")
+        }
+    }
+
+    private fun buildPipAction(): android.app.RemoteAction {
+        val reopen = PendingIntent.getActivity(
+            this, 1, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val icon = Icon.createWithResource(this, android.R.drawable.ic_menu_rotate)
+        return android.app.RemoteAction(
+            icon, "Открыть", "Развернуть лаунчер", reopen,
+        )
     }
 
     private fun openKeptInWindows() {
@@ -526,6 +656,7 @@ class MainActivity : ComponentActivity() {
             if (!matches(a)) continue
             sb.append(a.packageName)
             sb.append(if (a.packageName in keptPkgs) '1' else '0')
+            sb.append(if (a.packageName in pinnedPkgs) '1' else '0')
             sb.append(if (running(a.packageName)) '1' else '0')
         }
         return sb.toString()
@@ -584,6 +715,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val KEEP_EXTRA = "keep_pkgs"
+        const val PIN_EXTRA = "pin_pkgs"
         private const val REFRESH_MS = 2500L
         private const val MIN_CARD_WIDTH_DP = 150
     }
