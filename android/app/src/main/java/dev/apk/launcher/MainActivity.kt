@@ -2,22 +2,18 @@ package dev.apk.launcher
 
 import android.Manifest
 import android.app.ActivityOptions
-import android.app.PendingIntent
-import android.app.PictureInPictureParams
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
-import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
-import android.util.Rational
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -94,39 +90,14 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        // В PiP лаунчер остаётся видимым и «живым»: не останавливаем refresh.
-        if (!isInPictureInPictureMode) handler.removeCallbacks(refresh)
-        super.onPause()
-    }
-
-    override fun onStop() {
         handler.removeCallbacks(refresh)
-        super.onStop()
+        super.onPause()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(refresh)
         super.onDestroy()
     }
-
-    @Suppress("DEPRECATION")
-    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean) {
-        super.onPictureInPictureModeChanged(isInPictureInPictureMode)
-        if (isInPictureInPictureMode) {
-            pipHiddenBar = updateBar.visibility
-            pipHiddenPanel = processPanel.visibility
-            updateBar.visibility = View.GONE
-            processPanel.visibility = View.GONE
-        } else {
-            updateBar.visibility = pipHiddenBar
-            updateProcessPane()
-            handler.removeCallbacks(refresh)
-            handler.post(refresh)
-        }
-    }
-
-    private var pipHiddenBar = View.GONE
-    private var pipHiddenPanel = View.GONE
 
     private fun maybeRequestNotifPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -184,20 +155,6 @@ class MainActivity : ComponentActivity() {
         vlp.setMargins(dp(10), 0, 0, 0)
         versionTv.layoutParams = vlp
         titleRow.addView(versionTv)
-        titleRow.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-        val pipBtn = Button(this)
-        pipBtn.text = "PiP"
-        pipBtn.textSize = 12f
-        pipBtn.isAllCaps = false
-        pipBtn.minimumWidth = 0
-        pipBtn.minimumHeight = 0
-        pipBtn.setTextColor(Color.parseColor("#22c55e"))
-        pipBtn.setBackgroundResource(R.drawable.pill_keep_on)
-        val pipLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        pipLp.setMargins(dp(6), 0, 0, 0)
-        pipBtn.layoutParams = pipLp
-        pipBtn.setOnClickListener { enterPip() }
-        titleRow.addView(pipBtn)
         header.addView(titleRow)
 
         updateBar = vBox()
@@ -268,8 +225,8 @@ class MainActivity : ComponentActivity() {
 
         val statSplit = statColumn()
         statSplitNum = statsNum(statSplit)
-        statsLabel(statSplit, "в окна")
-        statSplit.setOnClickListener { openKeptInWindows() }
+        statsLabel(statSplit, "все мини")
+        statSplit.setOnClickListener { openKeptInMiniWindows() }
         keepbar.addView(statSplit)
         root.addView(keepbar)
 
@@ -529,23 +486,51 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchMini(pkg: String) {
+        launchMini(pkg, 0)
+    }
+
+    private fun launchMini(pkg: String, offset: Int) {
         val ok = runCatching {
             val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            val opts = ActivityOptions.makeBasic().setLaunchBounds(miniBounds())
-            startActivity(i, opts.toBundle())
+            startActivity(i, miniWindowOptions(offset).toBundle())
             true
         }.getOrDefault(false)
         if (!ok) toast("Не удалось открыть $pkg в мини-окне")
     }
 
-    private fun miniBounds(): Rect {
+    private fun openKeptInMiniWindows() {
+        val pkgs = keptPkgs.sorted()
+        if (pkgs.isEmpty()) {
+            toast("Нет приложений на keep")
+            return
+        }
+        pkgs.forEachIndexed { idx, pkg -> launchMini(pkg, idx) }
+    }
+
+    private fun miniWindowOptions(offset: Int): ActivityOptions {
         val dm = resources.displayMetrics
         val w = (dm.widthPixels * 0.62f).toInt()
         val h = (dm.heightPixels * 0.6f).toInt()
-        val x = dm.widthPixels - w - dp(14)
-        val y = dm.heightPixels - h - dp(14)
-        return Rect(x, y, x + w, y + h)
+        val baseX = dm.widthPixels - w - dp(14)
+        val baseY = dm.heightPixels - h - dp(14)
+        val x = maxOf(0, baseX - offset * dp(28))
+        val y = maxOf(0, baseY - offset * dp(28))
+        return ActivityOptions.makeBasic().apply {
+            setLaunchBounds(Rect(x, y, x + w, y + h))
+            tryFreeform()
+        }
+    }
+
+    // Публичный путь — setLaunchBounds; бесплатно-оконный режим подключаем
+    // рефлексией (hide setLaunchWindowingMode), если система позволит.
+    private fun ActivityOptions.tryFreeform() {
+        runCatching {
+            ActivityOptions::class.java
+                .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(this, WINDOWING_MODE_FREEFORM)
+        }
     }
 
     private fun togglePin(pkg: String) {
@@ -559,42 +544,7 @@ class MainActivity : ComponentActivity() {
         keeper.syncService()
         lastSig = ""
         renderCards()
-    }
-
-    private fun enterPip() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            runCatching {
-                val params = PictureInPictureParams.Builder().apply {
-                    setAspectRatio(Rational(1, 1))
-                    setActions(listOf(buildPipAction()))
-                }.build()
-                enterPictureInPictureMode(params)
-            }.onFailure {
-                toast("Не удалось свернуть в PiP")
-            }
-        } else {
-            toast("PiP доступен на Android 8.0+")
-        }
-    }
-
-    private fun buildPipAction(): android.app.RemoteAction {
-        val reopen = PendingIntent.getActivity(
-            this, 1, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val icon = Icon.createWithResource(this, android.R.drawable.ic_menu_rotate)
-        return android.app.RemoteAction(
-            icon, "Открыть", "Развернуть лаунчер", reopen,
-        )
-    }
-
-    private fun openKeptInWindows() {
-        val pkgs = keptPkgs.sorted()
-        if (pkgs.isEmpty()) {
-            toast("Нет приложений на keep")
-            return
-        }
-        for (p in pkgs) launchAdjacent(p)
+        if (pin) launchMini(clean)
     }
 
     private fun loadApps() {
@@ -718,5 +668,6 @@ class MainActivity : ComponentActivity() {
         const val PIN_EXTRA = "pin_pkgs"
         private const val REFRESH_MS = 2500L
         private const val MIN_CARD_WIDTH_DP = 150
+        private const val WINDOWING_MODE_FREEFORM = 5
     }
 }

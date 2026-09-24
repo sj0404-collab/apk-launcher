@@ -119,29 +119,36 @@ class KeepAliveService : Service() {
             val launch = packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
                 launch.addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or
-                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 )
-                // «Пинованные» приложения поднимаем сразу в уменьшенном окне,
-                // чтобы не теряли фокус и не убивались фоном.
-                val opts = if (pkg in pinned) {
-                    android.app.ActivityOptions.makeBasic().setLaunchBounds(miniBounds())
+                if (pkg in pinned) {
+                    // «Пинованные» поднимаем сразу в интерактивном мини-окне
+                    // (весь экран приложения в уменьшенном виде, без потери фокуса).
+                    startActivity(launch, freeformOptions())
                 } else {
-                    android.app.ActivityOptions.makeBasic()
+                    launch.addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+                    startActivity(launch)
                 }
-                startActivity(launch, opts.toBundle())
             }
         }
     }
 
-    private fun miniBounds(): Rect {
+    private fun freeformOptions(): android.os.Bundle {
         val dm = resources.displayMetrics
         val w = (dm.widthPixels * 0.62f).toInt()
         val h = (dm.heightPixels * 0.6f).toInt()
         val x = dm.widthPixels - w
         val y = dm.heightPixels - h
-        return Rect(x, y, x + w, y + h)
+        val opts = android.app.ActivityOptions.makeBasic().apply {
+            setLaunchBounds(Rect(x, y, x + w, y + h))
+            runCatching {
+                android.app.ActivityOptions::class.java
+                    .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(this, WINDOWING_MODE_FREEFORM)
+            }
+        }
+        return opts.toBundle()
     }
 
     private fun createChannel() {
@@ -199,5 +206,6 @@ class KeepAliveService : Service() {
         private const val NOTIF_ID = 7
         private const val WATCH_INTERVAL_MS = 2000L
         private const val RELAUNCH_MIN_GAP_MS = 15000L
+        private const val WINDOWING_MODE_FREEFORM = 5
     }
 }
