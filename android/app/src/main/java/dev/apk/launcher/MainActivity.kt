@@ -12,6 +12,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
+import android.net.Uri
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
@@ -490,13 +492,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchMini(pkg: String, offset: Int) {
+        if (!requireOverlayPermission()) return
         val ok = runCatching {
             val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i, miniWindowOptions(offset).toBundle())
             true
         }.getOrDefault(false)
-        if (!ok) toast("Не удалось открыть $pkg в мини-окне")
+        if (ok) overlayFor(pkg, show = true) else toast("Не удалось открыть $pkg в мини-окне")
     }
 
     private fun openKeptInMiniWindows() {
@@ -544,7 +547,36 @@ class MainActivity : ComponentActivity() {
         keeper.syncService()
         lastSig = ""
         renderCards()
-        if (pin) launchMini(clean)
+        if (pin) launchMini(clean) else overlayFor(clean, show = false)
+    }
+
+    private fun requireOverlayPermission(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            runCatching {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                )
+            }
+            toast("Включите «отображение поверх других окон» — тогда появятся кнопки мини-окна")
+            return false
+        }
+        return true
+    }
+
+    private fun overlayFor(pkg: String, show: Boolean) {
+        val i = Intent(this, KeepAliveService::class.java)
+            .setAction(
+                if (show) KeepAliveService.ACTION_SHOW_OVERLAY
+                else KeepAliveService.ACTION_HIDE_OVERLAY
+            )
+            .putExtra(KeepAliveService.EXTRA_PKG, pkg.substringBefore(':'))
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(i)
+            } else {
+                startService(i)
+            }
+        }
     }
 
     private fun loadApps() {
