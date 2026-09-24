@@ -1,39 +1,26 @@
 # APK Launcher
 
-HTML/TSX-лаунчер, живущий внутри APK-обёртки на WebView. Список установленных
+Нативный (без WebView и HTML) Android-лаунчер: список установленных
 приложений, запуск одной кнопкой и keep-alive: выбранные приложения держатся
 живыми foreground-сервисом, который их перезапускает, если процесс умирает.
 
 ## Структура
 
-- `web/` — React + TypeScript лаунчер (Vite). Собирается прямо в assets APK.
-- `android/` — APK: WebView-обёртка, мост `ZenBridge`, сервис-держатель процессов.
+- `android/` — весь код на Kotlin: нативный UI, `AppKeeper`, сервис-держатель
+  процессов. Веб-части нет.
 
-## Веб-часть
-
-```
-cd web
-npm install
-npm run build      # кладёт index.html+js в ../android/app/src/main/assets/panel
-npm run dev        # разработочный сервер (без моста: покажет заглушку)
-```
-
-Мост `ZenBridge` появляется только внутри WebView обёртки. В браузере лаунчер
-понимает, что моста нет, и показывает подсказку.
-
-## APK-обёртка
+## Сборка
 
 ```
 cd android
-gradle :app:assembleDebug   # нужен SDK, адрес в local.properties
+./gradlew :app:assembleDebug   # нужен SDK, адрес в local.properties
 ```
 
-Что делает приложение:
+## Что делает приложение
 
-- `MainActivity` — WebView, отдаёт страницу из assets, обслуживает `icon://<pkg>`
-  через `IconServer` (иконки приложений без сети).
-- `LauncherBridge` — JS-интерфейс: `listApps()`, `launchApp(pkg)`,
-  `keepApp(pkg, bool)`, `getKeeps()`, `listProcesses()`.
+- `MainActivity` — полностью нативный UI (без WebView/JS): поиск, сетка карточек
+  приложений с иконками, запуск по тапу, тумблер keep-alive, панель живых
+  процессов, автообновление каждые 2.5 с.
 - `AppKeeper` — хранит список «держимых» пакетов и перезапускает
   foreground-сервис.
 - `KeepAliveService` — foreground-сервис с ваклоком и ватчдогом: каждые 2 с
@@ -43,8 +30,3 @@ gradle :app:assembleDebug   # нужен SDK, адрес в local.properties
 приложений; на Android 10+ фоновый запуск сервисами ограничен, поэтому
 обёртка использует foreground-сервис типа `specialUse` с удержанием wake lock —
 полноценная борьба с фоном всё равно возможна только при видимом уведомлении.
-
-## Мост (сторона JS)
-
-Типы и обёртки в `web/src/bridge.ts` и `web/src/types.ts`. Любой вызов
-проверяет наличие `window.ZenBridge`, чтобы UI не падал вне обёртки.
