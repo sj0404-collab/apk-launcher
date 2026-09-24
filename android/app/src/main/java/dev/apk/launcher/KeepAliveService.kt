@@ -12,12 +12,16 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 
 class KeepAliveService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val kept = HashSet<String>()
     private val pinned = HashSet<String>()
+    private val reluctant = HashSet<String>()
+    private val forceRelaunchTime = HashMap<String, Long>()
+    private val lastAlive = HashMap<String, Long>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var running = true
 
@@ -47,6 +51,10 @@ class KeepAliveService : Service() {
             kept.addAll(list)
             pinned.clear()
             pinned.addAll(pins ?: emptyList())
+            // Списки «нелюбимых» и тайминги привязываем к актуальному составу keep.
+            reluctant.retainAll(kept)
+            forceRelaunchTime.keys.retainAll(kept)
+            lastAlive.keys.retainAll(kept)
         } else if (kept.isEmpty()) {
             // Система перезапустила процесс (START_STICKY / null intent) —
             // восстанавливаем списки «держимых» и «мини-окон» из хранилища.
@@ -66,10 +74,43 @@ class KeepAliveService : Service() {
 
     private fun ensureKeptProcesses() {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-        val current = am.runningAppProcesses?.map { it.processName } ?: emptyList()
+        val current = am.runningAppProcesses ?: emptyList()
+
+        // Пока лаунчер в фокусе — не поднимаем приложения поверх него,
+        // иначе невозможно выбрать другое приложение.
+        val launcherFocused = current.any {
+            it.processName == packageName &&
+                it.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        }
+
+        val now = SystemClock.elapsedRealtime()
         for (pkg in kept) {
-            val alive = current.any { it == pkg || it.startsWith("$pkg:") }
-            if (!alive) relaunch(pkg)
+            if (pkg in reluctant) continue
+            val alive = current.any { it.processName == pkg || it.processName.startsWith("$pkg:") }
+            val lastAliveAt = lastAlive[pkg] ?: 0L
+            val lastForced = forceRelaunchTime[pkg] ?: 0L
+            if (alive) {
+                lastAlive[pkg] = now
+                if (lastForced != 0L && lastAliveAt != 0L && now - lastForced > RELAUNCH_MIN_GAP_MS) {
+                    // Пожил подольше — доверие вернулось, авто-рестарты активны.
+                    reluctant.remove(pkg)
+                }
+                continue
+            }
+            if (now - lastAliveAt < RELAUNCH_MIN_GAP_MS) {
+                // Только что был жив — его закрыли руками (свайп/стоп).
+                // Никаких мгновенных «воскрешений» на глазах у пользователя.
+                if (lastForced != 0L) reluctant.add(pkg)
+                continue
+            }
+            if (now - lastForced < RELAUNCH_MIN_GAP_MS) {
+                // Наш подъём тут же снова снесён — стоп авто-перезапускам.
+                reluctant.add(pkg)
+                continue
+            }
+            if (launcherFocused) continue
+            relaunch(pkg)
+            forceRelaunchTime[pkg] = now
         }
     }
 
@@ -157,5 +198,6 @@ class KeepAliveService : Service() {
         private const val CHANNEL_ID = "keep-alive"
         private const val NOTIF_ID = 7
         private const val WATCH_INTERVAL_MS = 2000L
+        private const val RELAUNCH_MIN_GAP_MS = 15000L
     }
 }
