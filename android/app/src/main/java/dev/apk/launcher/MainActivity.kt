@@ -1,6 +1,7 @@
 package dev.apk.launcher
 
 import android.Manifest
+import android.app.ActivityOptions
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -52,6 +53,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var statAppsNum: TextView
     private lateinit var statAppsLabel: TextView
     private lateinit var statAliveNum: TextView
+    private lateinit var statSplitNum: TextView
     private lateinit var scrollContent: LinearLayout
     private lateinit var cardsBox: LinearLayout
     private lateinit var processPanel: LinearLayout
@@ -216,6 +218,12 @@ class MainActivity : ComponentActivity() {
             render()
         }
         keepbar.addView(statRefresh)
+
+        val statSplit = statColumn()
+        statSplitNum = statsNum(statSplit)
+        statsLabel(statSplit, "в окна")
+        statSplit.setOnClickListener { openKeptInWindows() }
+        keepbar.addView(statSplit)
         root.addView(keepbar)
 
         val scroller = ScrollView(this)
@@ -330,6 +338,7 @@ class MainActivity : ComponentActivity() {
         keepBtn.setBackgroundResource(if (kept) R.drawable.pill_keep_on else R.drawable.pill_keep_off)
         keepBtn.setOnClickListener { toggleKeep(app.packageName) }
         row.addView(keepBtn)
+        row.addView(miniBtn("в окно") { launchAdjacent(app.packageName) })
         return card
     }
 
@@ -337,6 +346,7 @@ class MainActivity : ComponentActivity() {
         statAppsNum.text = if (showKeptOnly) keptPkgs.size.toString() else allApps.size.toString()
         statAppsLabel.text = if (showKeptOnly) "на keep" else "приложений"
         statAliveNum.text = keptPkgs.count { running(it) }.toString()
+        statSplitNum.text = keptPkgs.size.toString()
     }
 
     private fun updateProcessPane() {
@@ -389,6 +399,7 @@ class MainActivity : ComponentActivity() {
         state.setPadding(dp(8), dp(2), dp(8), dp(2))
         row.addView(state)
 
+        row.addView(miniBtn("в окно") { launchAdjacent(p.packageName) })
         row.addView(miniBtn("запустить") { launch(p.packageName) })
         row.addView(miniBtn(if (kept) "снять keep" else "keep") { toggleKeep(p.packageName) })
         return row
@@ -431,6 +442,29 @@ class MainActivity : ComponentActivity() {
             true
         }.getOrDefault(false)
         if (!ok) toast("Не удалось запустить $pkg")
+    }
+
+    private fun launchAdjacent(pkg: String) {
+        val ok = runCatching {
+            val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
+            i.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            )
+            startActivity(i, ActivityOptions.makeBasic().toBundle())
+            true
+        }.getOrDefault(false)
+        if (!ok) toast("Не удалось открыть $pkg рядом")
+    }
+
+    private fun openKeptInWindows() {
+        val pkgs = keptPkgs.sorted()
+        if (pkgs.isEmpty()) {
+            toast("Нет приложений на keep")
+            return
+        }
+        for (p in pkgs) launchAdjacent(p)
     }
 
     private fun loadApps() {

@@ -71,7 +71,9 @@ class KeepAliveService : Service() {
             val launch = packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
                 launch.addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or
+                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 )
                 startActivity(launch)
             }
