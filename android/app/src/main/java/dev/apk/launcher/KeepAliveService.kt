@@ -18,6 +18,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
@@ -200,13 +201,13 @@ class KeepAliveService : Service() {
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(3), dp(6), dp(3), dp(6))
-            background = Gradient.drawRound(0xcc101420.toInt(), dp(14))
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            background = Gradient.drawRound(0xcc101420.toInt(), dp(16))
+            addView(ovBtn("\u2715") { closeWindow(pkg) })   // ✕ закрыть
             addView(ovBtn("\u25A3") { fullWindow(pkg) })   // ▣ во весь экран
             addView(ovBtn("+") { scaleWindow(pkg, 1.2f) })   // увеличить
             addView(ovBtn("\u2212") { scaleWindow(pkg, 0.82f) }) // сузить
             addView(ovBtn("\u25C7") { moveWindow(pkg) })   // ◇ сменить позицию
-            addView(ovBtn("\u2715") { closeWindow(pkg) })  // ✕ закрыть
         }
         val onTopType =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -224,9 +225,10 @@ class KeepAliveService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(12)
-            y = bounds.top + dp(12)
+            // Панель прибита к правому краю экрана и не двигается сама.
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            x = dp(10)
+            y = 0
         }
         runCatching { wm.addView(bar, params) }.onFailure { return }
         overlays[pkg] = OverlayController(bar, params)
@@ -240,19 +242,26 @@ class KeepAliveService : Service() {
     }
 
     private fun ovBtn(glyph: String, action: () -> Unit): TextView {
-        val s = dp(16).toFloat()
+        val close = glyph == "\u2715"
         return TextView(this).apply {
             text = glyph
-            setTextColor(0xFFF2F5FA.toInt())
-            textSize = s
+            setTextColor(if (close) 0xFFFF8080.toInt() else 0xFFF2F5FA.toInt())
+            textSize = dp(15).toFloat()
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            minimumWidth = dp(36)
-            minimumHeight = dp(36)
+            minimumWidth = dp(46)
+            minimumHeight = dp(46)
+            background = Gradient.drawRound(
+                if (close) 0xCC33111F.toInt() else 0xDD1A2233.toInt(),
+                dp(11),
+            )
             setOnClickListener { action() }
-            if (glyph == "\u2715") {
-                background = Gradient.drawRound(0xCC33111F.toInt(), dp(10))
-                setTextColor(0xFFFF8080.toInt())
+            setOnTouchListener { v, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> v.alpha = 0.55f
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.alpha = 1f
+                }
+                false
             }
         }
     }
@@ -274,15 +283,12 @@ class KeepAliveService : Service() {
     private fun scaleWindow(pkg: String, factor: Float) {
         val cur = lastBounds[pkg] ?: miniBounds().also { lastBounds[pkg] = it }
         val dm = resources.displayMetrics
-        val cw = cur.width()
-        val ch = cur.height()
-        var w = (cw * factor).toInt()
-        var h = (ch * factor).toInt()
+        var w = (cur.width() * factor).toInt()
+        var h = (cur.height() * factor).toInt()
         w = w.coerceIn((dm.widthPixels * 0.26f).toInt(), (dm.widthPixels * 0.96f).toInt())
         h = h.coerceIn((dm.heightPixels * 0.26f).toInt(), (dm.heightPixels * 0.96f).toInt())
-        val cx = cur.centerX()
-        val cy = cur.centerY()
-        val r = Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        var r = Rect(cur.left, cur.top, cur.left + w, cur.top + h)
+        r = clampOnScreen(r)
         applyBounds(pkg, r)
     }
 
@@ -301,7 +307,7 @@ class KeepAliveService : Service() {
         val idx = ((positionPreset[pkg] ?: -1) + 1) % ANCHORS.size
         positionPreset[pkg] = idx
         val (grav, ax, ay) = ANCHORS[idx]
-        val r = when (grav) {
+        var r = when (grav) {
             Gravity.BOTTOM or Gravity.START -> Rect(ax, dh - h - ay, w + ax, dh - ay)
             Gravity.BOTTOM or Gravity.END -> Rect(dw - w - ax, dh - h - ay, dw - ax, dh - ay)
             Gravity.TOP or Gravity.END -> Rect(dw - w - ax, ay, dw - ax, h + ay)
@@ -309,33 +315,30 @@ class KeepAliveService : Service() {
             Gravity.CENTER -> Rect((dw - w) / 2, (dh - h) / 2, (dw + w) / 2, (dh + h) / 2)
             else -> Rect(ax, ay, w + ax, h + ay) // TOP or START
         }
+        r = clampOnScreen(r)
         applyBounds(pkg, r)
     }
 
+    private fun clampOnScreen(r: Rect): Rect {
+        val dm = resources.displayMetrics
+        val x = r.left.coerceIn(0, (dm.widthPixels - r.width()).coerceAtLeast(0))
+        val y = r.top.coerceIn(0, (dm.heightPixels - r.height()).coerceAtLeast(0))
+        return Rect(x, y, x + r.width(), y + r.height())
+    }
+
     private fun applyBounds(pkg: String, r: Rect) {
+        val cur = lastBounds[pkg]
+        if (cur != null && cur == r) return
         lastBounds[pkg] = r
         runCatching {
             val launch = packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-                // Если окно уже открыто — задача выводится вперёд с новыми
-                // размерами; если нет — запускается заново в мини-окне.
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // Если окно уже открыто — та же задача выводится вперёд с новыми
+                // размерами (без пересоздания и сброса состояния); если нет —
+                // запускается заново в мини-окне.
                 startActivity(launch, freeformOptions(r))
             }
-        }
-        repositionBar(pkg, r)
-    }
-
-    private fun repositionBar(pkg: String, r: Rect) {
-        val controller = overlays[pkg] ?: return
-        controller.params.apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(12)
-            y = r.top + dp(12)
-        }
-        runCatching {
-            (getSystemService(WINDOW_SERVICE) as WindowManager)
-                .updateViewLayout(controller.bar, controller.params)
         }
     }
 
