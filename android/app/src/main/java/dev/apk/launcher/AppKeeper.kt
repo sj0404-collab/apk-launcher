@@ -67,7 +67,7 @@ class AppKeeper(private val context: Context) {
             putStringArrayListExtra(MainActivity.PIN_EXTRA, ArrayList(pins))
             if (reactivate != null) putExtra(KeepAliveService.EXTRA_REACTIVATE, reactivate)
         }
-        if (list.isEmpty() && pins.isEmpty()) {
+        if (list.isEmpty() && pins.isEmpty() && !KeepAliveService.hasPersistedOverlays(context)) {
             context.stopService(intent)
             return
         }

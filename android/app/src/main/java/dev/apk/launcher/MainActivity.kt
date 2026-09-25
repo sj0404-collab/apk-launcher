@@ -153,6 +153,7 @@ class MainActivity : ComponentActivity() {
 
     private var updateUrl = ""
     private val pendingOverlays = HashMap<String, Rect>()
+    private val miniBoundsByPackage = HashMap<String, Rect>()
 
     private fun buildUi() {
         val root = vBox()
@@ -506,8 +507,7 @@ class MainActivity : ComponentActivity() {
             val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
             i.addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or
-                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                    Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT
             )
             startActivity(i, ActivityOptions.makeBasic().toBundle())
             true
@@ -527,14 +527,25 @@ class MainActivity : ComponentActivity() {
             toast("Не удалось найти приложение $pkg")
             return
         }
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val bounds = miniWindowBounds(offset)
-        val launchedInWindow = if (canUseFreeform()) {
+        launch.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
+                Intent.FLAG_ACTIVITY_RETAIN_IN_RECENTS
+        )
+        val requestedOffset = if (offset == 0 && pkg !in miniBoundsByPackage) {
+            miniBoundsByPackage.size * 2
+        } else {
+            offset
+        }
+        val bounds = miniBoundsByPackage[pkg] ?: miniWindowBounds(requestedOffset).also {
+            miniBoundsByPackage[pkg] = Rect(it)
+        }
+        val launchedInWindow = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             runCatching {
                 val options = ActivityOptions.makeBasic().apply {
                     setLaunchBounds(bounds)
+                    setFreeformModeBestEffort()
                 }
-                if (!tryFreeform(options)) error("freeform unavailable")
                 startActivity(launch, options.toBundle())
                 true
             }.getOrDefault(false)
@@ -571,7 +582,7 @@ class MainActivity : ComponentActivity() {
         val gap = dp(14)
         val maxX = (screenWidth() - w - gap).coerceAtLeast(0)
         val maxY = (screenHeight() - h - gap).coerceAtLeast(0)
-        val step = dp(24)
+        val step = dp(32)
         val maxSteps = minOf(maxX, maxY) / step
         val steps = offset.coerceIn(0, maxSteps)
         val x = (maxX - steps * step).coerceAtLeast(0)
@@ -579,28 +590,23 @@ class MainActivity : ComponentActivity() {
         return Rect(x, y, x + w, y + h)
     }
 
-    private fun canUseFreeform(): Boolean =
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-            packageManager.hasSystemFeature(PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT)
-
-    private fun tryFreeform(options: ActivityOptions): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
-        val windowing = runCatching {
-            ActivityOptions::class.java
-                .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-                .invoke(options, WINDOWING_MODE_FREEFORM)
-            true
-        }.getOrDefault(false)
-        if (windowing || Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) return windowing
-        return runCatching {
-            ActivityOptions::class.java
-                .getMethod("setLaunchStackId", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-                .invoke(options, FREEFORM_STACK_ID)
-            true
-        }.getOrDefault(false)
+    private fun ActivityOptions.setFreeformModeBestEffort() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching {
+                ActivityOptions::class.java
+                    .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(this, WINDOWING_MODE_FREEFORM)
+            }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            runCatching {
+                ActivityOptions::class.java
+                    .getMethod("setLaunchStackId", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(this, FREEFORM_STACK_ID)
+            }
+        }
     }
 
     private fun togglePin(pkg: String) {

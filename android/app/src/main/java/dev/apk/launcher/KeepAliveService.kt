@@ -119,6 +119,7 @@ class KeepAliveService : Service() {
             }
             ACTION_HIDE_OVERLAY -> intent.getStringExtra(EXTRA_PKG)?.let { hideOverlay(it) }
         }
+        restoreOverlays()
 
         handler.removeCallbacks(watchdog)
         handler.post(watchdog)
@@ -218,18 +219,41 @@ class KeepAliveService : Service() {
             forceRelaunchTime[pkg] = if (forced > now) 0L else forced
             lastAlive[pkg] = if (alive > now) 0L else alive
         }
+        val boundsPackages = statePrefs.getStringSet(STATE_BOUNDS, emptySet()).orEmpty()
+        for (pkg in boundsPackages) {
+            val prefix = STATE_BOUND_PREFIX + pkg
+            if (statePrefs.getBoolean(prefix, false)) {
+                lastBounds[pkg] = Rect(
+                    statePrefs.getInt("$prefix:left", 0),
+                    statePrefs.getInt("$prefix:top", 0),
+                    statePrefs.getInt("$prefix:right", 0),
+                    statePrefs.getInt("$prefix:bottom", 0),
+                )
+            }
+        }
     }
 
     private fun saveState() {
         val packages = reluctant + forceRelaunchTime.keys + lastAlive.keys
+        val bounds = lastBounds.filterValues { it.width() > 0 && it.height() > 0 }
         val editor = statePrefs.edit()
             .putStringSet(STATE_PACKAGES, packages)
             .putStringSet(STATE_RELUCTANT, reluctant.toSet())
+            .putStringSet(STATE_OVERLAYS, overlays.keys.toSet())
+            .putStringSet(STATE_BOUNDS, bounds.keys)
         forceRelaunchTime.forEach { (pkg, time) ->
             editor.putLong(STATE_FORCE_PREFIX + pkg, time)
         }
         lastAlive.forEach { (pkg, time) ->
             editor.putLong(STATE_ALIVE_PREFIX + pkg, time)
+        }
+        bounds.forEach { (pkg, rect) ->
+            val prefix = STATE_BOUND_PREFIX + pkg
+            editor.putBoolean(prefix, true)
+            editor.putInt("$prefix:left", rect.left)
+            editor.putInt("$prefix:top", rect.top)
+            editor.putInt("$prefix:right", rect.right)
+            editor.putInt("$prefix:bottom", rect.bottom)
         }
         editor.apply()
     }
@@ -240,9 +264,7 @@ class KeepAliveService : Service() {
         }
         val launch = packageManager.getLaunchIntentForPackage(pkg) ?: return false
         return runCatching {
-            launch.addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-            )
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             if (pkg in pinned) {
                 val options = freeformOptions(lastBounds[pkg] ?: miniBounds())
                 if (options != null) {
@@ -261,35 +283,33 @@ class KeepAliveService : Service() {
     }
 
     private fun freeformOptions(bounds: Rect? = null): android.os.Bundle? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || !supportsFreeform()) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
         val r = bounds ?: miniBounds()
-        val opts = android.app.ActivityOptions.makeBasic().apply { setLaunchBounds(r) }
-        if (!tryFreeform(opts)) return null
+        val opts = android.app.ActivityOptions.makeBasic().apply {
+            setLaunchBounds(r)
+            setFreeformModeBestEffort()
+        }
         return opts.toBundle()
     }
 
-    private fun tryFreeform(options: android.app.ActivityOptions): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
-        val windowing = runCatching {
-            android.app.ActivityOptions::class.java
-                .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-                .invoke(options, WINDOWING_MODE_FREEFORM)
-            true
-        }.getOrDefault(false)
-        if (windowing || Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) return windowing
-        return runCatching {
-            android.app.ActivityOptions::class.java
-                .getMethod("setLaunchStackId", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-                .invoke(options, FREEFORM_STACK_ID)
-            true
-        }.getOrDefault(false)
+    private fun android.app.ActivityOptions.setFreeformModeBestEffort() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching {
+                android.app.ActivityOptions::class.java
+                    .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(this, WINDOWING_MODE_FREEFORM)
+            }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            runCatching {
+                android.app.ActivityOptions::class.java
+                    .getMethod("setLaunchStackId", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(this, FREEFORM_STACK_ID)
+            }
+        }
     }
-
-    private fun supportsFreeform(): Boolean =
-        packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT)
 
     private fun miniBounds(): Rect {
         val width = screenWidth()
@@ -302,6 +322,13 @@ class KeepAliveService : Service() {
     }
 
     // ================= Оверлей кнопок мини-окна =================
+
+    private fun restoreOverlays() {
+        val stored = statePrefs.getStringSet(STATE_OVERLAYS, emptySet()).orEmpty().toList()
+        for (pkg in stored) {
+            if (pkg !in overlays) showOverlay(pkg, lastBounds[pkg])
+        }
+    }
 
     fun showOverlay(pkg: String, requestedBounds: Rect? = null) {
         val clean = pkg.substringBefore(':')
@@ -341,15 +368,19 @@ class KeepAliveService : Service() {
         }
         runCatching { wm.addView(bar, params) }.onFailure { return }
         overlays[clean] = OverlayController(bar, params)
+        saveState()
         bar.post { positionOverlay(clean) }
     }
 
-    fun hideOverlay(pkg: String) {
+    fun hideOverlay(pkg: String, persist: Boolean = true) {
         val clean = pkg.substringBefore(':')
-        val controller = overlays.remove(clean) ?: return
-        runCatching {
-            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(controller.bar)
+        val controller = overlays.remove(clean)
+        if (controller != null) {
+            runCatching {
+                (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(controller.bar)
+            }
         }
+        if (persist) saveState()
     }
 
     private fun positionOverlay(pkg: String) {
@@ -399,36 +430,43 @@ class KeepAliveService : Service() {
             setOnTouchListener { v, e ->
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> v.alpha = 0.45f
-                    MotionEvent.ACTION_UP -> {
-                        v.alpha = 1f
-                        v.performClick()
-                    }
-                    MotionEvent.ACTION_CANCEL -> v.alpha = 1f
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.alpha = 1f
                 }
-                true
+                false
             }
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun detachWindow(pkg: String) {
         val clean = pkg.substringBefore(':')
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val taskId = runCatching {
+            am.getRunningTasks(100).firstOrNull {
+                it.baseActivity?.packageName == clean ||
+                    it.topActivity?.packageName == clean
+            }?.id
+        }.getOrNull()
+        val moved = taskId?.let {
+            runCatching {
+                am.javaClass.getMethod("moveTaskToBack", Int::class.javaPrimitiveType)
+                    .invoke(am, it) as? Boolean
+            }.getOrNull() == true
+        } ?: false
+        val hidden = moved || runCatching {
+            startActivity(
+                Intent(Intent.ACTION_MAIN)
+                    .addCategory(Intent.CATEGORY_HOME)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            true
+        }.getOrDefault(false)
         hideOverlay(clean)
         pinned.remove(clean)
         reluctant.add(clean)
         saveState()
-        AppKeeper(this).setPin(clean, false)
-        val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-        runCatching { am.killBackgroundProcesses(clean) }
-        handler.postDelayed({
-            val still = runCatching {
-                am.runningAppProcesses?.any { isProcessForPackage(it, clean) } ?: false
-            }.getOrDefault(false)
-            if (still) {
-                toast("Приложение оставлено — закройте его в недавних приложениях")
-            } else {
-                toast("Приложение закрыто")
-            }
-        }, 600)
+        AppKeeper(this).set(clean, false)
+        toast(if (hidden) "Окно скрыто" else "Не удалось скрыть окно")
     }
 
     private fun scaleWindow(pkg: String, factor: Float) {
@@ -485,9 +523,7 @@ class KeepAliveService : Service() {
         val options = launch?.let { freeformOptions(bounds) }
         val applied = if (launch != null && options != null) {
             runCatching {
-                launch.addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                )
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(launch, options)
                 true
             }.getOrDefault(false)
@@ -573,7 +609,7 @@ class KeepAliveService : Service() {
         running = false
         saveState()
         handler.removeCallbacks(watchdog)
-        for (pkg in overlays.keys.toList()) hideOverlay(pkg)
+        for (pkg in overlays.keys.toList()) hideOverlay(pkg, persist = false)
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         super.onDestroy()
@@ -595,6 +631,12 @@ class KeepAliveService : Service() {
     }
 
     companion object {
+        fun hasPersistedOverlays(context: Context): Boolean =
+            context.getSharedPreferences("service_state", Context.MODE_PRIVATE)
+                .getStringSet(STATE_OVERLAYS, emptySet())
+                .orEmpty()
+                .isNotEmpty()
+
         const val ACTION_SHOW_OVERLAY = "dev.apk.launcher.action.SHOW_OVERLAY"
         const val ACTION_HIDE_OVERLAY = "dev.apk.launcher.action.HIDE_OVERLAY"
         const val EXTRA_PKG = "pkg"
@@ -602,8 +644,11 @@ class KeepAliveService : Service() {
         const val EXTRA_REACTIVATE = "reactivate"
         private const val STATE_PACKAGES = "packages"
         private const val STATE_RELUCTANT = "reluctant"
+        private const val STATE_OVERLAYS = "overlays"
+        private const val STATE_BOUNDS = "bounds"
         private const val STATE_FORCE_PREFIX = "force:"
         private const val STATE_ALIVE_PREFIX = "alive:"
+        private const val STATE_BOUND_PREFIX = "bound:"
         private const val CHANNEL_ID = "keep-alive"
         private const val NOTIF_ID = 7
         private const val WATCH_INTERVAL_MS = 2000L
