@@ -12,13 +12,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.net.Uri
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
@@ -27,6 +28,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -83,6 +85,7 @@ class MainActivity : ComponentActivity() {
         keptPkgs = keeper.list().toSet()
         pinnedPkgs = keeper.pinnedList().toSet()
         keeper.syncService()
+        showPendingOverlays()
         loadProcesses()
         lastSig = ""
         render()
@@ -112,13 +115,12 @@ class MainActivity : ComponentActivity() {
     private fun checkForUpdate() {
         Updater.check(this, BuildConfig.VERSION_NAME) { latest, url ->
             updateUrl = url
-            updateLatest = latest
             updateBar.removeAllViews()
             val title = tv("Обновление $latest доступно", 14f, Color.parseColor("#4ade80"), Typeface.BOLD)
             updateBar.addView(title)
             val btns = hBox()
             btns.gravity = Gravity.CENTER_VERTICAL
-            btns.addView(miniBtn("открыть релиз") { openUrl(updateUrl) }, LinearLayout.LayoutParams(
+            btns.addView(miniBtn("скачать APK") { openUrl(updateUrl) }, LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             btns.addView(miniBtn("позже") { updateBar.visibility = View.GONE }, LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -131,13 +133,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openUrl(url: String) {
+        val uri = runCatching { Uri.parse(url) }.getOrNull()
+        if (uri == null || uri.scheme != "https" || !isTrustedUpdateHost(uri.host)) {
+            toast("Некорректная ссылка обновления")
+            return
+        }
         runCatching {
-            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
         }.onFailure { toast("Не удалось открыть ссылку") }
     }
 
+    private fun isTrustedUpdateHost(host: String?): Boolean {
+        val value = host?.lowercase(Locale.ROOT) ?: return false
+        return value == "github.com" ||
+            value == "githubusercontent.com" ||
+            value.endsWith(".github.com") ||
+            value.endsWith(".githubusercontent.com")
+    }
+
     private var updateUrl = ""
-    private var updateLatest = ""
+    private val pendingOverlays = HashMap<String, Rect>()
 
     private fun buildUi() {
         val root = vBox()
@@ -365,10 +380,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateStats() {
-        statAppsNum.text = if (showKeptOnly) keptPkgs.size.toString() else allApps.size.toString()
+        statAppsNum.text = String.format(
+            Locale.getDefault(),
+            "%d",
+            if (showKeptOnly) keptPkgs.size else allApps.size,
+        )
         statAppsLabel.text = if (showKeptOnly) "на keep" else "приложений"
-        statAliveNum.text = keptPkgs.count { running(it) }.toString()
-        statSplitNum.text = keptPkgs.size.toString()
+        statAliveNum.text = String.format(Locale.getDefault(), "%d", keptPkgs.count { running(it) })
+        statSplitNum.text = String.format(Locale.getDefault(), "%d", keptPkgs.size)
     }
 
     private fun updateProcessPane() {
@@ -400,7 +419,7 @@ class MainActivity : ComponentActivity() {
         icon.scaleType = ImageView.ScaleType.CENTER_CROP
         icon.layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
         icon.setImageDrawable(
-            runCatching { packageManager.getApplicationIcon(p.packageName) }.getOrNull()
+            runCatching { packageManager.getApplicationIcon(base) }.getOrNull()
                 ?: getDrawable(android.R.drawable.sym_def_app_icon),
         )
         row.addView(icon)
@@ -452,11 +471,20 @@ class MainActivity : ComponentActivity() {
 
     private fun toggleKeep(pkg: String) {
         val keep = pkg !in keptPkgs
+        if (keep && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !hasOverlayPermission()) {
+            toast("Для автоперезапуска включите отображение поверх других окон")
+            requestOverlayPermission()
+            return
+        }
         if (!keeper.set(pkg, keep)) {
             toast("Не удалось изменить keep-alive")
             return
         }
         keptPkgs = if (keep) keptPkgs + pkg else keptPkgs - pkg
+        if (!keep) {
+            pinnedPkgs = pinnedPkgs - pkg
+            overlayFor(pkg, show = false)
+        }
         lastSig = ""
         renderCards()
         updateStats()
@@ -492,14 +520,40 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchMini(pkg: String, offset: Int) {
-        if (!requireOverlayPermission()) return
-        val ok = runCatching {
-            val i = packageManager.getLaunchIntentForPackage(pkg) ?: return@runCatching false
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(i, miniWindowOptions(offset).toBundle())
+        val launch = runCatching {
+            packageManager.getLaunchIntentForPackage(pkg)
+        }.getOrNull()
+        if (launch == null) {
+            toast("Не удалось найти приложение $pkg")
+            return
+        }
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val bounds = miniWindowBounds(offset)
+        val launchedInWindow = if (canUseFreeform()) {
+            runCatching {
+                val options = ActivityOptions.makeBasic().apply {
+                    setLaunchBounds(bounds)
+                }
+                if (!tryFreeform(options)) error("freeform unavailable")
+                startActivity(launch, options.toBundle())
+                true
+            }.getOrDefault(false)
+        } else {
+            false
+        }
+        if (launchedInWindow) {
+            showOverlayOrRequest(pkg, bounds)
+            return
+        }
+        val opened = runCatching {
+            startActivity(launch)
             true
         }.getOrDefault(false)
-        if (ok) overlayFor(pkg, show = true) else toast("Не удалось открыть $pkg в мини-окне")
+        if (opened) {
+            toast("Свободное окно недоступно — открыто обычное окно")
+        } else {
+            toast("Не удалось открыть $pkg")
+        }
     }
 
     private fun openKeptInMiniWindows() {
@@ -511,29 +565,42 @@ class MainActivity : ComponentActivity() {
         pkgs.forEachIndexed { idx, pkg -> launchMini(pkg, idx) }
     }
 
-    private fun miniWindowOptions(offset: Int): ActivityOptions {
-        val dm = resources.displayMetrics
-        val w = (dm.widthPixels * 0.62f).toInt()
-        val h = (dm.heightPixels * 0.6f).toInt()
-        val baseX = dm.widthPixels - w - dp(14)
-        val baseY = dm.heightPixels - h - dp(14)
-        val x = maxOf(0, baseX - offset * dp(28))
-        val y = maxOf(0, baseY - offset * dp(28))
-        return ActivityOptions.makeBasic().apply {
-            setLaunchBounds(Rect(x, y, x + w, y + h))
-            tryFreeform()
-        }
+    private fun miniWindowBounds(offset: Int): Rect {
+        val w = (screenWidth() * 0.62f).toInt()
+        val h = (screenHeight() * 0.6f).toInt()
+        val gap = dp(14)
+        val maxX = (screenWidth() - w - gap).coerceAtLeast(0)
+        val maxY = (screenHeight() - h - gap).coerceAtLeast(0)
+        val step = dp(24)
+        val maxSteps = minOf(maxX, maxY) / step
+        val steps = offset.coerceIn(0, maxSteps)
+        val x = (maxX - steps * step).coerceAtLeast(0)
+        val y = (maxY - steps * step).coerceAtLeast(0)
+        return Rect(x, y, x + w, y + h)
     }
 
-    // Публичный путь — setLaunchBounds; бесплатно-оконный режим подключаем
-    // рефлексией (hide setLaunchWindowingMode), если система позволит.
-    private fun ActivityOptions.tryFreeform() {
-        runCatching {
+    private fun canUseFreeform(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+            packageManager.hasSystemFeature(PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT)
+
+    private fun tryFreeform(options: ActivityOptions): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+        val windowing = runCatching {
             ActivityOptions::class.java
                 .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
                 .apply { isAccessible = true }
-                .invoke(this, WINDOWING_MODE_FREEFORM)
-        }
+                .invoke(options, WINDOWING_MODE_FREEFORM)
+            true
+        }.getOrDefault(false)
+        if (windowing || Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) return windowing
+        return runCatching {
+            ActivityOptions::class.java
+                .getMethod("setLaunchStackId", Int::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(options, FREEFORM_STACK_ID)
+            true
+        }.getOrDefault(false)
     }
 
     private fun togglePin(pkg: String) {
@@ -544,38 +611,64 @@ class MainActivity : ComponentActivity() {
             return
         }
         pinnedPkgs = if (pin) pinnedPkgs + clean else pinnedPkgs - clean
-        keeper.syncService()
+        if (pin) keptPkgs = keptPkgs + clean
         lastSig = ""
         renderCards()
         if (pin) launchMini(clean) else overlayFor(clean, show = false)
     }
 
-    private fun requireOverlayPermission(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            runCatching {
-                startActivity(
-                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-                )
-            }
-            toast("Включите «отображение поверх других окон» — тогда появятся кнопки мини-окна")
-            return false
+    private fun showOverlayOrRequest(pkg: String, bounds: Rect) {
+        val clean = pkg.substringBefore(':')
+        if (hasOverlayPermission()) {
+            pendingOverlays.remove(clean)
+            overlayFor(clean, show = true, bounds = bounds)
+            return
         }
-        return true
+        pendingOverlays[clean] = Rect(bounds)
+        requestOverlayPermission()
+        toast("Включите «отображение поверх других окон» для кнопок мини-окна")
     }
 
-    private fun overlayFor(pkg: String, show: Boolean) {
+    private fun requestOverlayPermission() {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+        }.onFailure {
+            toast("Не удалось открыть настройки разрешения")
+        }
+    }
+
+    private fun showPendingOverlays() {
+        if (!hasOverlayPermission() || pendingOverlays.isEmpty()) return
+        val pending = pendingOverlays.toMap()
+        pendingOverlays.clear()
+        pending.forEach { (pkg, bounds) -> overlayFor(pkg, show = true, bounds = bounds) }
+    }
+
+    private fun hasOverlayPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+
+    private fun overlayFor(pkg: String, show: Boolean, bounds: Rect? = null) {
+        val clean = pkg.substringBefore(':')
         val i = Intent(this, KeepAliveService::class.java)
             .setAction(
                 if (show) KeepAliveService.ACTION_SHOW_OVERLAY
                 else KeepAliveService.ACTION_HIDE_OVERLAY
             )
-            .putExtra(KeepAliveService.EXTRA_PKG, pkg.substringBefore(':'))
+            .putExtra(KeepAliveService.EXTRA_PKG, clean)
+        if (bounds != null) i.putExtra(KeepAliveService.EXTRA_BOUNDS, bounds)
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(i)
             } else {
                 startService(i)
             }
+        }.onFailure {
+            toast("Не удалось запустить панель мини-окна")
         }
     }
 
@@ -596,7 +689,7 @@ class MainActivity : ComponentActivity() {
             val icon = runCatching { pm.getApplicationIcon(pkg) }.getOrNull()
             apps.add(AppEntry(pkg, label, version, icon))
         }
-        apps.sortBy { it.label.lowercase() }
+        apps.sortBy { it.label.lowercase(Locale.ROOT) }
         allApps = apps
     }
 
@@ -606,7 +699,11 @@ class MainActivity : ComponentActivity() {
         val running = am.runningAppProcesses ?: emptyList()
         val list = ArrayList<ProcEntry>()
         for (p in running) {
-            if (p.importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED) continue
+            if (p.importance <= 0 ||
+                p.importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY
+            ) {
+                continue
+            }
             list.add(ProcEntry(p.processName, p.pid, importanceName(p.importance)))
         }
         processes = list
@@ -614,10 +711,16 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun importanceName(importance: Int): String = when {
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_GONE -> "gone"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY -> "empty"
         importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND -> "background"
-        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE -> "сервис"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_TOP_SLEEPING -> "sleeping"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE -> "service"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_PERCEPTIBLE -> "perceptible"
         importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE -> "visible"
-        else -> "foreground"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE -> "сервис"
+        importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND -> "foreground"
+        else -> "unknown"
     }
 
     private fun running(pkg: String): Boolean =
@@ -625,10 +728,10 @@ class MainActivity : ComponentActivity() {
 
     private fun matches(a: AppEntry): Boolean {
         if (showKeptOnly && a.packageName !in keptPkgs) return false
-        val q = query.trim().lowercase()
+        val q = query.trim().lowercase(Locale.ROOT)
         return q.isEmpty() ||
-            a.label.lowercase().contains(q) ||
-            a.packageName.lowercase().contains(q)
+            a.label.lowercase(Locale.ROOT).contains(q) ||
+            a.packageName.lowercase(Locale.ROOT).contains(q)
     }
 
     private fun sig(): String {
@@ -693,6 +796,22 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
+    private fun screenWidth(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        runCatching {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).maximumWindowMetrics.bounds.width()
+        }.getOrDefault(resources.displayMetrics.widthPixels)
+    } else {
+        resources.displayMetrics.widthPixels
+    }
+
+    private fun screenHeight(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        runCatching {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).maximumWindowMetrics.bounds.height()
+        }.getOrDefault(resources.displayMetrics.heightPixels)
+    } else {
+        resources.displayMetrics.heightPixels
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     companion object {
@@ -701,5 +820,6 @@ class MainActivity : ComponentActivity() {
         private const val REFRESH_MS = 2500L
         private const val MIN_CARD_WIDTH_DP = 150
         private const val WINDOWING_MODE_FREEFORM = 5
+        private const val FREEFORM_STACK_ID = 2
     }
 }

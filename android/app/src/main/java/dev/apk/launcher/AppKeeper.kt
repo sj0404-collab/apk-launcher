@@ -13,49 +13,70 @@ class AppKeeper(private val context: Context) {
     private val pinPrefs: SharedPreferences =
         context.getSharedPreferences("pins", Context.MODE_PRIVATE)
 
+    init {
+        pruneMissingPackages()
+    }
+
     fun set(pkg: String, keep: Boolean): Boolean {
-        val clean = pkg.trim()
+        val clean = normalizePackage(pkg)
         if (clean.isEmpty()) return false
         val e = prefs.edit()
         if (keep) e.putBoolean(clean, true) else e.remove(clean)
         e.apply()
-        syncService()
+        if (!keep) pinPrefs.edit().remove(clean).apply()
+        syncService(if (keep) clean else null)
         return true
     }
 
     fun setPin(pkg: String, pin: Boolean): Boolean {
-        val clean = pkg.trim()
+        val clean = normalizePackage(pkg)
         if (clean.isEmpty()) return false
         val e = pinPrefs.edit()
         if (pin) e.putBoolean(clean, true) else e.remove(clean)
         e.apply()
+        if (pin) prefs.edit().putBoolean(clean, true).apply()
+        syncService(if (pin) clean else null)
         return true
     }
 
-    fun list(): List<String> =
-        prefs.all.filterValues { it == true }.keys.sorted()
+    fun list(): List<String> {
+        pruneMissingPackages()
+        return prefs.all.filterValues { it == true }.keys.sorted()
+    }
 
-    fun isKept(pkg: String): Boolean = prefs.getBoolean(pkg.trim(), false)
+    fun isKept(pkg: String): Boolean {
+        pruneMissingPackages()
+        return prefs.getBoolean(normalizePackage(pkg), false)
+    }
 
-    fun pinnedList(): List<String> =
-        pinPrefs.all.filterValues { it == true }.keys.sorted()
+    fun pinnedList(): List<String> {
+        pruneMissingPackages()
+        return pinPrefs.all.filterValues { it == true }.keys.sorted()
+    }
 
-    fun isPinned(pkg: String): Boolean = pinPrefs.getBoolean(pkg.trim(), false)
+    fun isPinned(pkg: String): Boolean {
+        pruneMissingPackages()
+        return pinPrefs.getBoolean(normalizePackage(pkg), false)
+    }
 
-    fun syncService() {
+    fun syncService(reactivate: String? = null) {
         val list = list()
+        val pins = pinnedList()
         val intent = Intent(context, KeepAliveService::class.java).apply {
             putStringArrayListExtra(MainActivity.KEEP_EXTRA, ArrayList(list))
-            putStringArrayListExtra(MainActivity.PIN_EXTRA, ArrayList(pinnedList()))
+            putStringArrayListExtra(MainActivity.PIN_EXTRA, ArrayList(pins))
+            if (reactivate != null) putExtra(KeepAliveService.EXTRA_REACTIVATE, reactivate)
         }
-        if (list.isEmpty()) {
+        if (list.isEmpty() && pins.isEmpty()) {
             context.stopService(intent)
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
     }
 
@@ -63,5 +84,49 @@ class AppKeeper(private val context: Context) {
         context.stopService(Intent(context, KeepAliveService::class.java))
         prefs.edit().clear().apply()
         pinPrefs.edit().clear().apply()
+    }
+
+    private fun pruneMissingPackages() {
+        val validKeeps = prefs.all.keys.mapNotNull { it as? String }.filter(::isInstalled)
+        val invalidKeeps = prefs.all.keys.mapNotNull { it as? String } - validKeeps.toSet()
+        if (invalidKeeps.isNotEmpty()) {
+            prefs.edit().apply { invalidKeeps.forEach(::remove) }.apply()
+        }
+
+        val validPins = pinPrefs.all.keys.mapNotNull { it as? String }.filter(::isInstalled)
+        val invalidPins = pinPrefs.all.keys.mapNotNull { it as? String } - validPins.toSet()
+        if (invalidPins.isNotEmpty()) {
+            pinPrefs.edit().apply { invalidPins.forEach(::remove) }.apply()
+        }
+
+        val pinsWithoutKeep = validPins.filter { !prefs.getBoolean(it, false) }
+        if (pinsWithoutKeep.isNotEmpty()) {
+            prefs.edit().apply {
+                pinsWithoutKeep.forEach { putBoolean(it, true) }
+            }.apply()
+        }
+    }
+
+    private fun normalizePackage(pkg: String): String = pkg.trim().substringBefore(':')
+
+    private fun isInstalled(pkg: String): Boolean {
+        if (runCatching {
+                context.packageManager.getApplicationInfo(pkg, 0)
+                true
+            }.getOrDefault(false)
+        ) {
+            return true
+        }
+        if (runCatching { context.packageManager.getLaunchIntentForPackage(pkg) != null }
+                .getOrDefault(false)
+        ) {
+            return true
+        }
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        return runCatching {
+            am.runningAppProcesses?.any {
+                it.processName == pkg || it.processName.startsWith("$pkg:")
+            } ?: false
+        }.getOrDefault(false)
     }
 }
