@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза, например v1.1.2"
+        required: true
+        type: string
+      prerelease:
+        description: "Пометить релиз как pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source with tags
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Validate tag input
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::Не указан тег релиза"
+            exit 1
+          fi
+          if ! echo "$TAG" | grep -Eq '^v?[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::error::Неверный формат тега: $TAG (ожидается v1.2 или v1.2.3)"
+            exit 1
+          fi
+
+      - name: Prepare tag for version resolution
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tagged=$(git rev-list -n 1 "$TAG")
+            head=$(git rev-parse HEAD)
+            if [ "$tagged" != "$head" ]; then
+              echo "::error::Тег $TAG уже указывает на другой коммит ($tagged)"
+              exit 1
+            fi
+            echo "Тег $TAG уже указывает на HEAD, переиспользуем"
+          else
+            git tag -a "$TAG" -m "$TAG"
+            echo "Создан локальный тег $TAG"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" >/dev/null
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+
+      - name: Detect release signing key
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] &&
+             [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Секреты подписи найдены, собираем подписанный release"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Секреты подписи не заданы (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD). Собирается debug-APK: он подписан отладочным ключом и не ставится поверх уже установленной сборки."
+          fi
+
+      - name: Materialize signing key
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p android/keystore
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/keystore/release.jks
+          {
+            printf 'storeFile=keystore/release.jks\n'
+            printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > android/keystore.properties
+
+      - name: Build release APK
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: android
+        run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Build debug APK fallback
+        if: steps.signing.outputs.signed != 'true'
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Collect and verify APK
+        id: apk
+        env:
+          TAG: ${{ inputs.tag }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          set -e
+          mkdir -p dist
+          if [ "$SIGNED" = "true" ]; then
+            src=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+            name="apk-launcher-$TAG.apk"
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$src"
+          else
+            src=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
+            name="apk-launcher-$TAG-debug.apk"
+          fi
+          cp "$src" "dist/$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging "dist/$name" | head -2
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-launcher-${{ inputs.tag }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Push tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: git push origin "refs/tags/$TAG"
+
+      - name: Collect release notes
+        env:
+          TAG: ${{ inputs.tag }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          if [ -n "$previous" ]; then
+            log=$(git log --no-merges --pretty=format:'- %s (%h)' "$previous..$TAG")
+          else
+            log=$(git log --no-merges -n 20 --pretty=format:'- %s (%h)' "$TAG")
+          fi
+          {
+            echo "## Изменения"
+            echo
+            echo "$log"
+            echo
+            if [ "$SIGNED" = "true" ]; then
+              echo "APK подписан релизным ключом, установка поверх предыдущей версии работает."
+            else
+              echo "## Внимание"
+              echo
+              echo "Секреты подписи не были заданы, поэтому APK подписан **отладочным** ключом."
+              echo "Поставить его поверх ранее выпущенной версии нельзя: подписи не совпадают."
+              echo "Старую версию приложения нужно удалить и поставить эту заново."
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub release
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.apk --clobber
+            echo "Релиз $TAG уже существовал, APK перезалит"
+          elif [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md \
+              --verify-tag --prerelease dist/*.apk
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md \
+              --verify-tag dist/*.apk
+          fi
