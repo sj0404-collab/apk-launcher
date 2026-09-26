@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Build
+import android.os.SystemClock
 
 class AppKeeper(private val context: Context) {
 
@@ -87,19 +88,24 @@ class AppKeeper(private val context: Context) {
     }
 
     private fun pruneMissingPackages() {
-        val validKeeps = prefs.all.keys.mapNotNull { it as? String }.filter(::isInstalled)
-        val invalidKeeps = prefs.all.keys.mapNotNull { it as? String } - validKeeps.toSet()
+        if (prefs.all.isEmpty() && pinPrefs.all.isEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastPruneAt in 0 until PRUNE_INTERVAL_MS) return
+        lastPruneAt = now
+
+        val keepKeys = prefs.all.keys.mapNotNull { it as? String }
+        val invalidKeeps = keepKeys.filterNot(::isInstalled)
         if (invalidKeeps.isNotEmpty()) {
             prefs.edit().apply { invalidKeeps.forEach(::remove) }.apply()
         }
 
-        val validPins = pinPrefs.all.keys.mapNotNull { it as? String }.filter(::isInstalled)
-        val invalidPins = pinPrefs.all.keys.mapNotNull { it as? String } - validPins.toSet()
+        val pinKeys = pinPrefs.all.keys.mapNotNull { it as? String }
+        val invalidPins = pinKeys.filterNot(::isInstalled)
         if (invalidPins.isNotEmpty()) {
             pinPrefs.edit().apply { invalidPins.forEach(::remove) }.apply()
         }
 
-        val pinsWithoutKeep = validPins.filter { !prefs.getBoolean(it, false) }
+        val pinsWithoutKeep = pinKeys.filter { !prefs.getBoolean(it, false) }
         if (pinsWithoutKeep.isNotEmpty()) {
             prefs.edit().apply {
                 pinsWithoutKeep.forEach { putBoolean(it, true) }
@@ -108,6 +114,11 @@ class AppKeeper(private val context: Context) {
     }
 
     private fun normalizePackage(pkg: String): String = pkg.trim().substringBefore(':')
+
+    private companion object {
+        const val PRUNE_INTERVAL_MS = 60_000L
+        var lastPruneAt = Long.MIN_VALUE / 2
+    }
 
     private fun isInstalled(pkg: String): Boolean {
         if (runCatching {

@@ -3,6 +3,7 @@ package dev.apk.launcher
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import dev.apk.launcher.BuildConfig.UPDATER_REPO
 import org.json.JSONArray
@@ -15,12 +16,16 @@ object Updater {
 
     private const val TAG = "APKUpdater"
     private const val RETRY_DELAY_MS = 500L
+    private const val CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000L
+    private const val PREFS = "update_check"
+    private const val KEY_LAST_CHECK = "last_check_ms"
     private val GITHUB_API = "https://api.github.com/repos/$UPDATER_REPO/releases/latest"
     private val busy = AtomicBoolean(false)
 
     fun check(
         context: Context,
         currentVersion: String,
+        force: Boolean = false,
         onResult: (latest: String, url: String) -> Unit,
     ) {
         if (context is android.app.Activity &&
@@ -28,9 +33,10 @@ object Updater {
         ) {
             return
         }
+        if (!shouldCheckNow(context, force)) return
         if (!busy.compareAndSet(false, true)) {
             Handler(Looper.getMainLooper()).postDelayed(
-                { check(context, currentVersion, onResult) },
+                { check(context, currentVersion, force, onResult) },
                 RETRY_DELAY_MS,
             )
             return
@@ -68,6 +74,18 @@ object Updater {
                 busy.set(false)
             }
         }.start()
+    }
+
+    private fun shouldCheckNow(context: Context, force: Boolean): Boolean {
+        val prefs = context.applicationContext
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val now = SystemClock.elapsedRealtime()
+        if (!force) {
+            val last = prefs.getLong(KEY_LAST_CHECK, -1L)
+            if (last >= 0L && now - last in 0 until CHECK_INTERVAL_MS) return false
+        }
+        prefs.edit().putLong(KEY_LAST_CHECK, now).apply()
+        return true
     }
 
     fun compareVersions(a: String, b: String): Int {

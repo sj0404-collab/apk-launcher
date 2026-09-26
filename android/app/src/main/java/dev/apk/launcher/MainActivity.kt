@@ -37,7 +37,10 @@ class MainActivity : ComponentActivity() {
         val label: String,
         val versionName: String,
         val icon: Drawable?,
-    )
+    ) {
+        val searchKey: String =
+            "$label $packageName".lowercase(Locale.ROOT)
+    }
 
     private data class ProcEntry(
         val packageName: String,
@@ -49,12 +52,18 @@ class MainActivity : ComponentActivity() {
     private val keeper by lazy { AppKeeper(applicationContext) }
 
     private var allApps: List<AppEntry> = emptyList()
+    private var loadedPackages: List<String> = emptyList()
     private var processes: List<ProcEntry> = emptyList()
+    private var runningBase: Set<String> = emptySet()
     private var keptPkgs: Set<String> = emptySet()
     private var pinnedPkgs: Set<String> = emptySet()
     private var query = ""
     private var showKeptOnly = false
     private var lastSig = ""
+    private var lastProcSig = ""
+    private var lastProcVisible = false
+    private var stableTicks = 0
+    private val iconCache = HashMap<String, Drawable>()
 
     private lateinit var statAppsNum: TextView
     private lateinit var statAppsLabel: TextView
@@ -68,8 +77,14 @@ class MainActivity : ComponentActivity() {
     private val refresh = object : Runnable {
         override fun run() {
             loadProcesses()
-            render()
-            handler.postDelayed(this, REFRESH_MS)
+            val changed = render()
+            stableTicks = if (changed) 0 else stableTicks + 1
+            val delay = when {
+                stableTicks < 2 -> REFRESH_FAST_MS
+                stableTicks < 6 -> REFRESH_MID_MS
+                else -> REFRESH_SLOW_MS
+            }
+            handler.postDelayed(this, delay)
         }
     }
 
@@ -88,6 +103,8 @@ class MainActivity : ComponentActivity() {
         showPendingOverlays()
         loadProcesses()
         lastSig = ""
+        lastProcSig = ""
+        stableTicks = 0
         render()
         handler.removeCallbacks(refresh)
         handler.post(refresh)
@@ -112,8 +129,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkForUpdate() {
-        Updater.check(this, BuildConfig.VERSION_NAME) { latest, url ->
+    private fun checkForUpdate(force: Boolean = false) {
+        Updater.check(this, BuildConfig.VERSION_NAME, force) { latest, url ->
             updateUrl = url
             updateBar.removeAllViews()
             val title = tv("Обновление $latest доступно", 14f, Color.parseColor("#4ade80"), Typeface.BOLD)
@@ -198,7 +215,7 @@ class MainActivity : ComponentActivity() {
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
-                query = s?.toString() ?: ""
+                query = s?.toString()?.trim()?.lowercase(Locale.ROOT).orEmpty()
                 lastSig = ""
                 renderCards()
             }
@@ -232,12 +249,15 @@ class MainActivity : ComponentActivity() {
         refreshNum.setTextColor(Color.parseColor("#66667a"))
         statsLabel(statRefresh, "обновить")
         statRefresh.setOnClickListener {
-            loadApps()
+            loadApps(force = true)
             keptPkgs = keeper.list().toSet()
             pinnedPkgs = keeper.pinnedList().toSet()
             loadProcesses()
             lastSig = ""
+            lastProcSig = ""
+            stableTicks = 0
             render()
+            checkForUpdate(force = true)
         }
         keepbar.addView(statRefresh)
 
@@ -267,14 +287,17 @@ class MainActivity : ComponentActivity() {
         scrollContent.addView(processPanel)
     }
 
-    private fun render() {
+    private fun render(): Boolean {
         val sig = sig()
+        var changed = false
         if (sig != lastSig) {
             renderCards()
             lastSig = sig
+            changed = true
         }
-        updateStats()
-        updateProcessPane()
+        if (updateStats()) changed = true
+        if (updateProcessPane()) changed = true
+        return changed
     }
 
     private fun renderCards() {
@@ -380,29 +403,66 @@ class MainActivity : ComponentActivity() {
         return card
     }
 
-    private fun updateStats() {
-        statAppsNum.text = String.format(
-            Locale.getDefault(),
-            "%d",
-            if (showKeptOnly) keptPkgs.size else allApps.size,
-        )
-        statAppsLabel.text = if (showKeptOnly) "на keep" else "приложений"
-        statAliveNum.text = String.format(Locale.getDefault(), "%d", keptPkgs.count { running(it) })
-        statSplitNum.text = String.format(Locale.getDefault(), "%d", keptPkgs.size)
+    private fun updateStats(): Boolean {
+        val appsNum = if (showKeptOnly) keptPkgs.size else allApps.size
+        val appsLabel = if (showKeptOnly) "на keep" else "приложений"
+        val aliveNum = keptPkgs.count { running(it) }
+        val keepNum = keptPkgs.size
+        var changed = false
+        if (statAppsNum.text.toString() != appsNum.toString()) {
+            statAppsNum.text = appsNum.toString()
+            changed = true
+        }
+        if (statAppsLabel.text.toString() != appsLabel) {
+            statAppsLabel.text = appsLabel
+            changed = true
+        }
+        if (statAliveNum.text.toString() != aliveNum.toString()) {
+            statAliveNum.text = aliveNum.toString()
+            changed = true
+        }
+        if (statSplitNum.text.toString() != keepNum.toString()) {
+            statSplitNum.text = keepNum.toString()
+            changed = true
+        }
+        return changed
     }
 
-    private fun updateProcessPane() {
-        processPanel.removeAllViews()
-        if (processes.isEmpty() && keptPkgs.isEmpty()) {
+    private fun updateProcessPane(): Boolean {
+        val visible = processes.isNotEmpty() || keptPkgs.isNotEmpty()
+        if (!visible) {
+            if (!lastProcVisible) return false
+            lastProcVisible = false
+            lastProcSig = ""
+            processPanel.removeAllViews()
             processPanel.visibility = View.GONE
-            return
+            return true
         }
+        val sig = procSig()
+        if (visible == lastProcVisible && sig == lastProcSig) return false
+        lastProcVisible = visible
+        lastProcSig = sig
+        processPanel.removeAllViews()
         processPanel.visibility = View.VISIBLE
         val title = tv("Процессы (${processes.size})", 15f, Color.WHITE, Typeface.BOLD)
         processPanel.addView(title)
         for (p in processes) {
             processPanel.addView(buildProcRow(p))
         }
+        return true
+    }
+
+    private fun procSig(): String {
+        if (processes.isEmpty() && keptPkgs.isEmpty()) return ""
+        val sb = StringBuilder(processes.size * 24)
+        for (p in processes) {
+            sb.append(p.packageName).append('/').append(p.pid)
+                .append('/').append(p.importance)
+                .append(if (p.packageName.substringBefore(':') in keptPkgs) '1' else '0')
+                .append(if (p.packageName.substringBefore(':') in pinnedPkgs) '1' else '0')
+                .append(';')
+        }
+        return sb.toString()
     }
 
     private fun buildProcRow(p: ProcEntry): View {
@@ -419,10 +479,7 @@ class MainActivity : ComponentActivity() {
         val icon = ImageView(this)
         icon.scaleType = ImageView.ScaleType.CENTER_CROP
         icon.layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
-        icon.setImageDrawable(
-            runCatching { packageManager.getApplicationIcon(base) }.getOrNull()
-                ?: getDrawable(android.R.drawable.sym_def_app_icon),
-        )
+        icon.setImageDrawable(iconFor(base))
         row.addView(icon)
 
         val name = tv(p.packageName, 13f, Color.WHITE)
@@ -452,6 +509,15 @@ class MainActivity : ComponentActivity() {
         row.addView(miniBtn("запустить") { launch(base) })
         row.addView(miniBtn(if (kept) "снять keep" else "keep") { toggleKeep(base) })
         return row
+    }
+
+    private fun iconFor(pkg: String): Drawable? {
+        iconCache[pkg]?.let { return it }
+        val icon = runCatching { packageManager.getApplicationIcon(pkg) }.getOrNull()
+            ?: getDrawable(android.R.drawable.sym_def_app_icon)
+            ?: return null
+        iconCache[pkg] = icon
+        return icon
     }
 
     private fun miniBtn(text: String, onClick: () -> Unit): Button {
@@ -678,16 +744,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun loadApps() {
+    private fun loadApps(force: Boolean = false) {
         val pm = packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val resolved = runCatching { pm.queryIntentActivities(intent, 0) }.getOrDefault(emptyList())
-        val seen = HashSet<String>()
-        val apps = ArrayList<AppEntry>()
+        val packages = ArrayList<String>(resolved.size)
+        val seen = HashSet<String>(resolved.size * 2)
         for (ri in resolved) {
             val pkg = ri.activityInfo.packageName
             if (pkg == packageName) continue
-            if (!seen.add(pkg)) continue
+            if (seen.add(pkg)) packages.add(pkg)
+        }
+        packages.sort()
+        if (!force && packages == loadedPackages) return
+        loadedPackages = packages
+        iconCache.keys.retainAll(packages.toSet())
+        val apps = ArrayList<AppEntry>(packages.size)
+        for (pkg in packages) {
             val label = runCatching {
                 pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
             }.getOrDefault(pkg)
@@ -703,7 +776,8 @@ class MainActivity : ComponentActivity() {
     private fun loadProcesses() {
         val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
         val running = am.runningAppProcesses ?: emptyList()
-        val list = ArrayList<ProcEntry>()
+        val list = ArrayList<ProcEntry>(running.size)
+        val base = HashSet<String>(running.size * 2)
         for (p in running) {
             if (p.importance <= 0 ||
                 p.importance >= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY
@@ -711,8 +785,10 @@ class MainActivity : ComponentActivity() {
                 continue
             }
             list.add(ProcEntry(p.processName, p.pid, importanceName(p.importance)))
+            base.add(p.processName.substringBefore(':'))
         }
         processes = list
+        runningBase = base
     }
 
     @Suppress("DEPRECATION")
@@ -729,19 +805,17 @@ class MainActivity : ComponentActivity() {
         else -> "unknown"
     }
 
-    private fun running(pkg: String): Boolean =
-        processes.any { p -> p.packageName == pkg || p.packageName.startsWith("$pkg:") }
+    private fun running(pkg: String): Boolean = runningBase.contains(pkg)
 
     private fun matches(a: AppEntry): Boolean {
         if (showKeptOnly && a.packageName !in keptPkgs) return false
-        val q = query.trim().lowercase(Locale.ROOT)
-        return q.isEmpty() ||
-            a.label.lowercase(Locale.ROOT).contains(q) ||
-            a.packageName.lowercase(Locale.ROOT).contains(q)
+        if (query.isEmpty()) return true
+        val q = query
+        return a.searchKey.contains(q) || a.packageName.contains(q)
     }
 
     private fun sig(): String {
-        val sb = StringBuilder()
+        val sb = StringBuilder(allApps.size * 6)
         sb.append(query).append('|').append(showKeptOnly).append('|')
         for (a in allApps) {
             if (!matches(a)) continue
@@ -823,7 +897,9 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val KEEP_EXTRA = "keep_pkgs"
         const val PIN_EXTRA = "pin_pkgs"
-        private const val REFRESH_MS = 2500L
+        private const val REFRESH_FAST_MS = 2500L
+        private const val REFRESH_MID_MS = 5000L
+        private const val REFRESH_SLOW_MS = 10000L
         private const val MIN_CARD_WIDTH_DP = 150
         private const val WINDOWING_MODE_FREEFORM = 5
         private const val FREEFORM_STACK_ID = 2

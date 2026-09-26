@@ -1,13 +1,14 @@
 package dev.apk.launcher
 
-import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -36,6 +37,11 @@ class KeepAliveService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var running = true
     private var lastStateSave = 0L
+    private var stateDirty = true
+    private var active: Set<String> = emptySet()
+    private var screenOn = true
+    private var lastNotificationText: String? = null
+    private var cachedNotification: Notification? = null
 
     private val overlays = HashMap<String, OverlayController>()
     private val lastBounds = HashMap<String, Rect>()
@@ -47,9 +53,27 @@ class KeepAliveService : Service() {
     private val watchdog = object : Runnable {
         override fun run() {
             if (!running) return
+            var next = WATCH_INTERVAL_SLOW_MS
             acquireWakeLock()
-            ensureKeptProcesses()
-            handler.postDelayed(this, WATCH_INTERVAL_MS)
+            try {
+                next = ensureKeptProcesses()
+            } finally {
+                releaseWakeLock()
+            }
+            if (running) handler.postDelayed(this, next)
+        }
+    }
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> screenOn = true
+                Intent.ACTION_SCREEN_OFF -> screenOn = false
+                else -> return
+            }
+            if (!running) return
+            handler.removeCallbacks(watchdog)
+            handler.post(watchdog)
         }
     }
 
@@ -62,13 +86,30 @@ class KeepAliveService : Service() {
             PowerManager.PARTIAL_WAKE_LOCK,
             "apk-launcher:keep-watchdog",
         )
-        acquireWakeLock()
+        wakeLock?.setReferenceCounted(false)
+        screenOn = pm.isInteractive
+        val screenFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenReceiver, screenFilter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(screenReceiver, screenFilter)
+            }
+        }
     }
 
-    @SuppressLint("WakelockTimeout")
     private fun acquireWakeLock() {
         val lock = wakeLock ?: return
-        if (!lock.isHeld) lock.acquire()
+        if (lock.isHeld) return
+        runCatching { lock.acquire(WAKE_LOCK_WINDOW_MS) }
+    }
+
+    private fun releaseWakeLock() {
+        val lock = wakeLock ?: return
+        if (lock.isHeld) runCatching { lock.release() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -88,7 +129,7 @@ class KeepAliveService : Service() {
             pinned.addAll(keeper.pinnedList())
             kept.addAll(pinned)
         }
-        val active = activePackages()
+        active = activePackages()
         intent?.getStringExtra(EXTRA_REACTIVATE)?.let { pkg ->
             reluctant.remove(pkg)
             forceRelaunchTime.remove(pkg)
@@ -97,6 +138,8 @@ class KeepAliveService : Service() {
         reluctant.retainAll(active)
         forceRelaunchTime.keys.retainAll(active)
         lastAlive.keys.retainAll(active)
+        lastNotificationText = null
+        cachedNotification = null
 
         val startedForeground = runCatching {
             startForeground(NOTIF_ID, buildNotification())
@@ -123,72 +166,115 @@ class KeepAliveService : Service() {
 
         handler.removeCallbacks(watchdog)
         handler.post(watchdog)
-        if (activePackages().isEmpty() && overlays.isEmpty()) {
+        if (active.isEmpty() && overlays.isEmpty()) {
             stopSelf()
             return START_NOT_STICKY
         }
         return START_STICKY
     }
 
-    private fun ensureKeptProcesses() {
+    private fun ensureKeptProcesses(): Long {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
         val current = am.runningAppProcesses ?: emptyList()
-        val active = activePackages()
-        val launcherFocused = isLauncherFocused(am, current)
+        val names = runningProcessNames(current)
         val now = SystemClock.elapsedRealtime()
+        val targets = active
+        var deadCount = 0
+        var relaunchPending = false
+        var anyRelaunched = false
+        var launcherFocused = false
 
-        for (pkg in active) {
-            val alive = current.any { isProcessForPackage(it, pkg) }
+        for (pkg in targets) {
+            if (isPackageRunning(names, pkg)) {
+                lastAlive[pkg] = now
+                if (pkg in pinned && !overlays.containsKey(pkg)) {
+                    showOverlay(pkg)
+                    stateDirty = true
+                }
+                if (forceRelaunchTime[pkg]?.let { now - it > RELAUNCH_MIN_GAP_MS } == true) {
+                    if (reluctant.remove(pkg)) stateDirty = true
+                }
+                continue
+            }
+            deadCount++
+            if (overlays.containsKey(pkg)) hideOverlay(pkg, persist = false)
             val lastAliveAt = lastAlive[pkg] ?: 0L
             val lastForced = forceRelaunchTime[pkg] ?: 0L
-            if (alive) {
-                lastAlive[pkg] = now
-                if (pkg in pinned && !overlays.containsKey(pkg)) showOverlay(pkg)
-                if (lastForced != 0L && lastAliveAt != 0L && now - lastForced > RELAUNCH_MIN_GAP_MS) {
-                    reluctant.remove(pkg)
-                }
-                continue
-            }
-            hideOverlay(pkg)
             if (pkg in reluctant || now - lastAliveAt < RELAUNCH_MIN_GAP_MS) {
-                if (lastForced != 0L && now - lastAliveAt < RELAUNCH_MIN_GAP_MS) {
+                if (lastForced != 0L && now - lastAliveAt < RELAUNCH_MIN_GAP_MS &&
                     reluctant.add(pkg)
+                ) {
+                    stateDirty = true
                 }
+                if (pkg !in reluctant) relaunchPending = true
                 continue
             }
-            if (now - lastForced < RELAUNCH_MIN_GAP_MS) continue
+            if (now - lastForced < RELAUNCH_MIN_GAP_MS) {
+                relaunchPending = true
+                continue
+            }
+            if (!launcherFocused) launcherFocused = isLauncherFocused(am, current)
             if (launcherFocused) continue
             if (relaunch(pkg) ||
                 (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !Settings.canDrawOverlays(this))
             ) {
                 forceRelaunchTime[pkg] = now
+                stateDirty = true
+                anyRelaunched = true
+            }
+            relaunchPending = true
+        }
+
+        if (overlays.isNotEmpty()) {
+            for (pkg in overlays.keys.toList()) {
+                if (!isPackageRunning(names, pkg)) hideOverlay(pkg, persist = false)
             }
         }
 
-        for (pkg in overlays.keys.toList()) {
-            if (current.none { isProcessForPackage(it, pkg) }) hideOverlay(pkg)
-        }
+        if (stateDirty || now - lastStateSave >= STATE_SAVE_INTERVAL_MS) saveState()
 
-        if (now - lastStateSave >= STATE_SAVE_INTERVAL_MS) {
-            saveState()
-            lastStateSave = now
-        }
-        if (activePackages().isEmpty() && overlays.isEmpty()) {
+        if (targets.isEmpty() && overlays.isEmpty()) {
             handler.removeCallbacks(watchdog)
             stopSelf()
+            return WATCH_INTERVAL_SLOW_MS
+        }
+        if (relaunchPending || anyRelaunched) return WATCH_INTERVAL_FAST_MS
+        if (deadCount > 0) return if (launcherFocused) WATCH_INTERVAL_MID_MS else WATCH_INTERVAL_SLOW_MS
+        return if (screenOn) WATCH_INTERVAL_MID_MS else WATCH_INTERVAL_SLOW_MS
+    }
+
+    private fun activePackages(): Set<String> {
+        if (kept.isEmpty() && pinned.isEmpty()) return emptySet()
+        return HashSet<String>(kept.size + pinned.size).apply {
+            addAll(kept)
+            addAll(pinned)
         }
     }
 
-    private fun activePackages(): Set<String> = (kept + pinned).toSet()
+    @Suppress("DEPRECATION")
+    private fun runningProcessNames(
+        current: List<android.app.ActivityManager.RunningAppProcessInfo>,
+    ): Set<String> {
+        val names = HashSet<String>(current.size * 2)
+        for (process in current) {
+            if (process.importance > 0 &&
+                process.importance < android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY
+            ) {
+                names.add(process.processName)
+            }
+        }
+        return names
+    }
 
     @Suppress("DEPRECATION")
-    private fun isProcessForPackage(
-        process: android.app.ActivityManager.RunningAppProcessInfo,
-        pkg: String,
-    ): Boolean =
-        process.importance > 0 &&
-            process.importance < android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY &&
-            (process.processName == pkg || process.processName.startsWith("$pkg:"))
+    private fun isPackageRunning(names: Set<String>, pkg: String): Boolean {
+        if (names.contains(pkg)) return true
+        val prefix = "$pkg:"
+        for (name in names) {
+            if (name.length > prefix.length && name.startsWith(prefix)) return true
+        }
+        return false
+    }
 
     @Suppress("DEPRECATION")
     private fun isLauncherFocused(
@@ -234,6 +320,8 @@ class KeepAliveService : Service() {
     }
 
     private fun saveState() {
+        stateDirty = false
+        lastStateSave = SystemClock.elapsedRealtime()
         val packages = reluctant + forceRelaunchTime.keys + lastAlive.keys
         val bounds = lastBounds.filterValues { it.width() > 0 && it.height() > 0 }
         val editor = statePrefs.edit()
@@ -256,6 +344,11 @@ class KeepAliveService : Service() {
             editor.putInt("$prefix:bottom", rect.bottom)
         }
         editor.apply()
+    }
+
+    private fun persistState() {
+        if (!stateDirty) return
+        saveState()
     }
 
     private fun relaunch(pkg: String): Boolean {
@@ -368,19 +461,20 @@ class KeepAliveService : Service() {
         }
         runCatching { wm.addView(bar, params) }.onFailure { return }
         overlays[clean] = OverlayController(bar, params)
-        saveState()
+        stateDirty = true
+        persistState()
         bar.post { positionOverlay(clean) }
     }
 
     fun hideOverlay(pkg: String, persist: Boolean = true) {
         val clean = pkg.substringBefore(':')
         val controller = overlays.remove(clean)
-        if (controller != null) {
-            runCatching {
-                (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(controller.bar)
-            }
+        if (controller == null) return
+        runCatching {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(controller.bar)
         }
-        if (persist) saveState()
+        stateDirty = true
+        if (persist) persistState()
     }
 
     private fun positionOverlay(pkg: String) {
@@ -464,6 +558,7 @@ class KeepAliveService : Service() {
         hideOverlay(clean)
         pinned.remove(clean)
         reluctant.add(clean)
+        stateDirty = true
         saveState()
         AppKeeper(this).set(clean, false)
         toast(if (hidden) "Окно скрыто" else "Не удалось скрыть окно")
@@ -535,6 +630,7 @@ class KeepAliveService : Service() {
             return
         }
         lastBounds[pkg] = bounds
+        stateDirty = true
         positionOverlay(pkg)
         val pct = ((bounds.width() * 100f) / screenWidth()).toInt()
         val name = pkg.substringAfterLast('.').ifBlank { pkg }
@@ -576,6 +672,13 @@ class KeepAliveService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        val targets = activePackages()
+        val summary = targets.take(3).joinToString(", ") { pkg ->
+            pkg.substringAfterLast('.').ifBlank { pkg }
+        }
+        val text = if (targets.isEmpty()) "Список пуст" else "Держу живыми: $summary"
+        cachedNotification?.takeIf { lastNotificationText == text }?.let { return it }
+
         val open = PendingIntent.getActivity(
             this,
             0,
@@ -588,14 +691,7 @@ class KeepAliveService : Service() {
         else
             Notification.Builder(this)
 
-        val active = activePackages()
-        val summary = active.take(3).joinToString(", ") { pkg ->
-            pkg.substringAfterLast('.').ifBlank { pkg }
-        }
-        val text = if (active.isEmpty()) "Список пуст"
-        else "Держу живыми: $summary"
-
-        return builder
+        val notification = builder
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle("APK Launcher")
             .setContentText(text)
@@ -603,6 +699,9 @@ class KeepAliveService : Service() {
             .setOngoing(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .build()
+        lastNotificationText = text
+        cachedNotification = notification
+        return notification
     }
 
     override fun onDestroy() {
@@ -610,7 +709,8 @@ class KeepAliveService : Service() {
         saveState()
         handler.removeCallbacks(watchdog)
         for (pkg in overlays.keys.toList()) hideOverlay(pkg, persist = false)
-        wakeLock?.let { if (it.isHeld) it.release() }
+        runCatching { unregisterReceiver(screenReceiver) }
+        releaseWakeLock()
         wakeLock = null
         super.onDestroy()
     }
@@ -651,8 +751,11 @@ class KeepAliveService : Service() {
         private const val STATE_BOUND_PREFIX = "bound:"
         private const val CHANNEL_ID = "keep-alive"
         private const val NOTIF_ID = 7
-        private const val WATCH_INTERVAL_MS = 2000L
-        private const val STATE_SAVE_INTERVAL_MS = 30000L
+        private const val WATCH_INTERVAL_FAST_MS = 2000L
+        private const val WATCH_INTERVAL_MID_MS = 6000L
+        private const val WATCH_INTERVAL_SLOW_MS = 15000L
+        private const val WAKE_LOCK_WINDOW_MS = 5000L
+        private const val STATE_SAVE_INTERVAL_MS = 120000L
         private const val RELAUNCH_MIN_GAP_MS = 15000L
         private const val WINDOWING_MODE_FREEFORM = 5
         private const val FREEFORM_STACK_ID = 2
